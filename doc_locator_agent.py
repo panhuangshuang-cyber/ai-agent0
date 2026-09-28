@@ -15,6 +15,7 @@ from agent_types import (
     decision_arguments,
     first_message,
     function_tool,
+    is_truncation_note as is_truncation_note_local,
     iter_tool_calls,
     normalize_rows,
     parse_memory_aliases,
@@ -75,7 +76,7 @@ class DocLocatorAgent:
         )
         if not docs_call.ok:
             logging.info("agent=locator tool=list_docs attempt=1 ok=false")
-            return LocatedResult(status="error", note=docs_call.text)
+            return LocatedResult(status="error", note="文档列表获取失败，请稍后重试。")
 
         docs = _extract_docs(docs_call.payload)
         titles = [item["title"] for item in docs]
@@ -102,11 +103,25 @@ class DocLocatorAgent:
                 }, ensure_ascii=False),
             },
         ]
+        if len(deterministic) != 1:
+            # 0 个（not_found）或多个（ambiguous）时不需要再问模型，直接返回。
+            if len(deterministic) > 1:
+                return LocatedResult(status="ambiguous", candidates=deterministic)
+            return LocatedResult(status="not_found")
+
+        selected_title = deterministic[0]
+        model_sheet_hint = ""
         decision: dict[str, Any] | None = None
         model_attempts = 0
+        llm_failed = False
         while model_attempts < 4:
             model_attempts += 1
-            response = await self._ask(messages)
+            try:
+                response = await self._ask(messages)
+            except Exception:
+                logging.warning("定位模型调用失败，使用确定性候选继续", exc_info=True)
+                llm_failed = True
+                break
             message = first_message(response)
             calls = iter_tool_calls(message)
             wrong_names = [tool_call_name(call) for call in calls if tool_call_name(call) != "locate_decision"]
@@ -122,16 +137,16 @@ class DocLocatorAgent:
             messages.append({"role": "user", "content": "没有收到合法的 locate_decision 参数，请重新定位。"})
 
         if decision is None:
-            return LocatedResult(status="error", note="定位模型没有返回合法结果")
+            if llm_failed:
+                # 模型挂了/超时：已有唯一确定性候选，直接用它继续。
+                logging.warning("定位模型不可用，使用确定性候选继续: %s", selected_title)
+            else:
+                return LocatedResult(status="error", note="定位模型没有返回合法结果")
 
-        if len(deterministic) > 1:
-            return LocatedResult(status="ambiguous", candidates=deterministic)
-        if not deterministic:
-            return LocatedResult(status="not_found")
-
-        selected_title = deterministic[0]
-        if clean_text(decision.get("doc_title")) != selected_title:
-            return LocatedResult(status="not_found")
+        if decision is not None:
+            model_sheet_hint = clean_text(decision.get("sheet_hint"))
+            if clean_text(decision.get("doc_title")) != selected_title:
+                return LocatedResult(status="not_found")
         doc = next(item for item in docs if item["title"] == selected_title)
 
         sheets_call = await safe_mcp_call(
@@ -142,9 +157,22 @@ class DocLocatorAgent:
             LOCATOR_SCOPE_REJECTION,
         )
         if not sheets_call.ok:
-            return LocatedResult(status="error", doc_title=selected_title, file_id=doc["id"], note=sheets_call.text)
+            logging.warning("list_sheets 失败: %s", selected_title)
+            return LocatedResult(status="error", doc_title=selected_title, file_id=doc["id"],
+                                 note="子表列表获取失败，请稍后重试。")
         sheets = _extract_sheets(sheets_call.payload)
+        sheet_titles = [sheet["title"] for sheet in sheets]
         sheet_hint = clean_text(plan.sheet_hint)
+        # 模型返回的 sheet_hint：plan 为空时，只有它能命中真实子表才采用
+        # （命中 1 张，或精确等于某张子表标题）；否则忽略模型擅自的选择，
+        # 保持原有的 ambiguous 行为。plan 非空时同理，只接受精确匹配的细化。
+        if not sheet_hint and model_sheet_hint:
+            model_candidates = [s for s in sheets if _contains(s["title"], model_sheet_hint)]
+            if len(model_candidates) == 1 or _exact_match(sheet_titles, model_sheet_hint):
+                sheet_hint = model_sheet_hint
+        elif sheet_hint and model_sheet_hint:
+            if model_sheet_hint != sheet_hint and _exact_match(sheet_titles, model_sheet_hint):
+                sheet_hint = model_sheet_hint
 
         if not sheet_hint:
             sheet_matches = sheets if len(sheets) == 1 else []
@@ -178,47 +206,80 @@ class DocLocatorAgent:
                 "sheet_name": sheet["title"],
                 "max_rows": row_limit,
                 "max_cols": 30,
+                "file_id": doc["id"],
+                "sheet_id": sheet["id"],
             },
             LOCATOR_TOOL_NAMES,
             LOCATOR_SCOPE_REJECTION,
         )
         if not read_call.ok:
+            # 回退 read_sheet 时按真实列数取范围（不再硬编码 AD=30 列）。
+            column_count = sheet.get("column_count") or 30
+            try:
+                column_count = int(column_count)
+            except (TypeError, ValueError):
+                column_count = 30
+            column_count = max(1, min(column_count, 30))
             read_call = await safe_mcp_call(
                 session,
                 "read_sheet",
                 {
                     "file_id": doc["id"],
                     "sheet_id": sheet["id"],
-                    "cell_range": f"A1:AD{row_limit}",
+                    "cell_range": f"A1:{_col_letter(column_count - 1)}{row_limit}",
                 },
                 LOCATOR_TOOL_NAMES,
                 LOCATOR_SCOPE_REJECTION,
             )
         if not read_call.ok:
+            logging.warning("表格读取失败: %s/%s", selected_title, sheet["title"])
             return LocatedResult(
                 status="error",
                 doc_title=selected_title,
                 file_id=doc["id"],
                 sheet_title=sheet["title"],
                 sheet_id=sheet["id"],
-                note=read_call.text,
+                note="表格内容读取失败，请稍后重试。",
             )
 
         payload = read_call.payload if isinstance(read_call.payload, dict) else {"data": read_call.payload}
         columns, rows, payload_truncated = normalize_rows(payload, row_limit, 30)
         row_count = sheet.get("row_count")
-        truncated = bool(
+        data_rows_returned = max(0, len(rows))
+        total_known: int | None = row_count if isinstance(row_count, int) else None
+        if total_known is None:
+            for key in ("total_rows", "totalRows", "row_count", "rowCount"):
+                value = payload.get(key)
+                try:
+                    if value is not None and str(value) != "":
+                        total_known = int(value)
+                        break
+                except (TypeError, ValueError):
+                    continue
+        # 截断判定：
+        # - 服务端明确标记（truncated/has_more/note 封顶字样）时永远截断；
+        # - 总数已知且“收到数据行 + 表头 == 总数”时视为完整读取，
+        #   不能仅因为“收到行数 == 读取上限”就判定截断；
+        # - “收到行数 == 上限”的封顶启发式只在总数未知时生效。
+        at_cap = data_rows_returned >= max(0, row_limit - 1)
+        server_flag = bool(
             payload.get("truncated")
             or payload.get("has_more")
-            or payload_truncated
-            or (isinstance(row_count, int) and row_count > len(rows) + 1)
+            or is_truncation_note_local(payload.get("note"))
         )
+        complete_by_total = total_known is not None and data_rows_returned + 1 >= total_known
+        cap_hit = at_cap or payload_truncated
+        truncated = server_flag or (not complete_by_total and (cap_hit or total_known is not None))
         read_range = clean_text(payload.get("read_range") or payload.get("range"))
         if not read_range:
-            read_range = f"A1:AD{min(row_limit, len(rows) + 1)}"
+            fallback_cols = max(1, min(len(columns) or 30, 30))
+            read_range = f"A1:{_col_letter(fallback_cols - 1)}{min(row_limit, len(rows) + 1)}"
         note = clean_text(payload.get("note"))
         if truncated and not note:
-            note = f"仅读取前 {len(rows)} 行数据"
+            if total_known is not None:
+                note = f"只读取了前 {data_rows_returned} 行（共 {total_known} 行），统计结果可能不完整。"
+            else:
+                note = f"只读取了前 {data_rows_returned} 行，统计结果可能不完整。"
 
         logging.info(
             "agent=locator intent=%s status=found tool=%s model_attempts=%s",
@@ -278,6 +339,18 @@ def _extract_docs(payload: Any) -> list[dict[str, str]]:
     return result
 
 
+def _col_letter(index: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA …（列号转 A1 表示法字母）。"""
+    letter = ""
+    n = max(0, int(index))
+    while True:
+        letter = chr(n % 26 + 65) + letter
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return letter
+
+
 def _extract_sheets(payload: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for item in _unwrap_list(payload, ("list", "sheets", "worksheets", "items", "data")):
@@ -292,8 +365,13 @@ def _extract_sheets(payload: Any) -> list[dict[str, Any]]:
             count = int(count) if count is not None and count != "" else None
         except (TypeError, ValueError):
             count = None
+        column_count = item.get("column_count", item.get("columnCount", item.get("colCount")))
+        try:
+            column_count = int(column_count) if column_count is not None and column_count != "" else None
+        except (TypeError, ValueError):
+            column_count = None
         if title and sheet_id:
-            result.append({"title": title, "id": sheet_id, "row_count": count})
+            result.append({"title": title, "id": sheet_id, "row_count": count, "column_count": column_count})
     return result
 
 
@@ -309,12 +387,38 @@ def _formal_hint(raw_hint: str, aliases: dict[str, str]) -> str:
 
 
 def _contains(title: str, hint: str) -> bool:
-    title_fold = clean_text(title).casefold()
-    hint_fold = clean_text(hint).casefold()
-    return bool(hint_fold and (hint_fold in title_fold or title_fold in hint_fold))
+    """hint 是 title 的子串（或精确相等）才算命中。
+
+    精确（大小写/空白归一化后相等）直接命中；除此之外只允许
+    “hint 是 title 的子串”（title 包含 hint）。title 仅仅是 hint
+    的子串（例如 title="销售"、hint="销售存档"）不算命中。
+    """
+    title_norm = clean_text(title).casefold()
+    hint_norm = clean_text(hint).casefold()
+    if not hint_norm or not title_norm:
+        return False
+    if title_norm == hint_norm:
+        return True
+    return hint_norm in title_norm
+
+
+def _exact_match(titles: list[str], hint: str) -> str | None:
+    hint_norm = clean_text(hint).casefold()
+    if not hint_norm:
+        return None
+    for title in titles:
+        if clean_text(title).casefold() == hint_norm:
+            return title
+    return None
 
 
 def _contains_matches(titles: list[str], hint: str) -> list[str]:
+    hint_norm = clean_text(hint).casefold()
+    if not hint_norm:
+        return []
+    exact = _exact_match(titles, hint)
+    if exact is not None:
+        return [exact]
     return [title for title in titles if _contains(title, hint)]
 
 

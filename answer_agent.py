@@ -32,6 +32,11 @@ class AnswerAgent:
         located: LocatedResult,
         analysis: AnalysisResult | None,
     ) -> str:
+        partial_notes: list[str] = []
+        if located.truncated and located.note:
+            partial_notes.append(located.note)
+        if analysis is not None and analysis.partial and analysis.partial_note:
+            partial_notes.append(analysis.partial_note)
         material: dict[str, Any] = {
             "user_text": user_text,
             "question": plan.question,
@@ -41,11 +46,14 @@ class AnswerAgent:
             "read_range": located.read_range,
             "truncated": located.truncated,
             "note": located.note,
+            "partial_notes": partial_notes,
         }
         if plan.intent == "analyze":
             material["analysis"] = {
                 "status": analysis.status if analysis else "error",
                 "output": clip_text(analysis.output if analysis else "没有分析结果", 4000),
+                "partial": bool(analysis and analysis.partial),
+                "partial_note": analysis.partial_note if analysis else "",
             }
         else:
             material["rows"] = located.rows[:20]
@@ -55,7 +63,11 @@ class AnswerAgent:
             {"role": "user", "content": json.dumps(material, ensure_ascii=False)},
         ])
         message = first_message(response)
-        return str(getattr(message, "content", "") or "").strip()
+        text = str(getattr(message, "content", "") or "").strip()
+        for note in partial_notes:
+            if note and note not in text:
+                text = (text + "\n\n" + note).strip()
+        return text
 
 
 answer_agent = AnswerAgent()
