@@ -33,7 +33,16 @@ class AnswerAgent:
         analysis: AnalysisResult | None,
     ) -> str:
         partial_notes: list[str] = []
-        if located.truncated and located.note:
+        # 分析成功时，统计是在分析工具自己读取的数据上完成的；定位阶段只读了
+        # 几行预览，它的“只读取了前 N 行”不代表统计范围，不能再提示给用户。
+        analysis_ok = plan.intent == "analyze" and analysis is not None and analysis.status == "ok"
+        if analysis_ok:
+            truncated = bool(analysis.partial)
+            note = analysis.partial_note if analysis.partial else ""
+        else:
+            truncated = located.truncated
+            note = located.note
+        if not analysis_ok and located.truncated and located.note:
             partial_notes.append(located.note)
         if analysis is not None and analysis.partial and analysis.partial_note:
             partial_notes.append(analysis.partial_note)
@@ -44,8 +53,8 @@ class AnswerAgent:
             "sheet_title": located.sheet_title,
             "columns": located.columns,
             "read_range": located.read_range,
-            "truncated": located.truncated,
-            "note": located.note,
+            "truncated": truncated,
+            "note": note,
             "partial_notes": partial_notes,
         }
         if plan.intent == "analyze":
