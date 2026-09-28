@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-import ast
 import asyncio
 import json
 import logging
@@ -40,8 +39,12 @@ def mcp_init_timeout_seconds() -> float:
 
 
 def analysis_timeout_seconds() -> float:
-    """单次 analyze_sheet_pandas 工具调用超时（秒）。"""
-    return _env_float("ANALYSIS_TIMEOUT_SECONDS", 30.0)
+    """单次 analyze_sheet_pandas 工具调用超时（秒）。
+
+    服务端沙箱默认 20 秒，且分页读取最多可能发起 ~10 次表格请求，
+    所以默认放宽到 90 秒，保证服务端自己的“代码执行超时”文案能到达用户。
+    """
+    return _env_float("ANALYSIS_TIMEOUT_SECONDS", 90.0)
 
 
 def chat_timeout_seconds() -> float:
@@ -71,30 +74,6 @@ MEMORY_TOOL_NAMES = frozenset({"update_memory_rule", "memory_decision"})
 LOCATOR_SCOPE_REJECTION = "这个工具不在文档定位的范围内"
 ANALYST_SCOPE_REJECTION = "这个工具不在数据分析的范围内"
 INVALID_JSON_REJECTION = "工具参数不是合法 JSON"
-
-FORBIDDEN_CODE_FRAGMENTS = (
-    "import",
-    "__",
-    "open(",
-    "exec(",
-    "eval(",
-    "compile(",
-    "globals(",
-    "locals(",
-    "getattr(",
-    "setattr(",
-    "input(",
-    "breakpoint(",
-    "os",
-    "sys",
-    "subprocess",
-    "socket",
-    "pathlib",
-    "shutil",
-    "requests",
-    "pickle",
-    "ctypes",
-)
 
 
 @dataclass
@@ -137,17 +116,14 @@ class AnalysisResult:
 
 PARTIAL_ANALYSIS_PREFIX = "只读取了前"
 
-#: 服务端认为“截断”字样的提示关键词。
+#: 服务端认为“截断”字样的提示关键词（只保留明确标记，避免把
+#: “部分字段为空”“capacity”之类的正常说明误判成截断）。
 TRUNCATION_NOTE_KEYWORDS = (
     "capped",
-    "cap",
-    "truncat",
-    "仅读取",
-    "只读取",
-    "只读",
-    "前 ",
+    "truncated",
+    "只读取了前",
+    "仅读取前",
     "不完整",
-    "部分",
 )
 
 
@@ -373,7 +349,8 @@ async def safe_mcp_call(
     except (asyncio.TimeoutError, TimeoutError) as exc:
         logging.warning("MCP 工具调用超时: %s 超过 %s 秒", name, timeout)
         return ToolExecution(
-            name=name, called=True, ok=False, text="工具调用超时，请稍后重试或把问题缩小一些。"
+            name=name, called=True, ok=False,
+            text=f"工具调用超时（超过 {timeout:g} 秒），请稍后重试或把问题缩小一些。"
         )
     except asyncio.CancelledError:
         raise
@@ -396,42 +373,9 @@ async def safe_mcp_call(
 
 
 def validate_analysis_code(code: Any) -> str:
-    text = str(code or "")
-    lowered = text.lower()
-    for fragment in FORBIDDEN_CODE_FRAGMENTS:
-        if fragment in lowered:
-            return f"代码包含禁止内容：{fragment}"
-    try:
-        tree = ast.parse(text, mode="exec")
-    except SyntaxError as exc:
-        return f"代码语法错误：{exc.msg}"
-
-    has_print_call = False
-    forbidden_names = {
-        "open", "exec", "eval", "compile", "globals", "locals", "getattr",
-        "setattr", "input", "breakpoint", "__import__",
-    }
-    forbidden_attrs = {
-        "read_csv", "read_excel", "read_json", "read_html", "read_pickle",
-        "read_parquet", "read_sql", "to_csv", "to_excel", "to_json",
-        "to_pickle", "to_parquet", "to_sql",
-    }
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            return "代码包含禁止内容：import"
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                if node.func.id == "print":
-                    has_print_call = True
-                if node.func.id in forbidden_names:
-                    return f"代码包含禁止调用：{node.func.id}"
-            elif isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_attrs:
-                return f"代码包含禁止调用：{node.func.attr}"
-        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-            return "代码包含禁止内容：__"
-    if not has_print_call:
-        return "代码必须包含 print 调用"
-    return ""
+    """校验分析代码（委托给 safe_pandas 的 AST 白名单校验）。"""
+    from safe_pandas import validate_code
+    return validate_code(code)
 
 
 def parse_memory_aliases(memory_text: str) -> dict[str, str]:

@@ -175,8 +175,30 @@ class GradioRegressionTests(unittest.TestCase):
         asyncio.run(drive())
 
     def test_fetch_file_tree_failure_is_friendly(self):
-        html = custom_ui.fetch_file_tree()
+        # 绝不触网：MCP_SERVER_DIR 指向临时目录里的假 client（构造即抛错），
+        # 并保证 sys.modules['client'] 不会残留污染其他测试。
+        import sys
+        tmp = tempfile.TemporaryDirectory()
+        with open(os.path.join(tmp.name, "client.py"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "class TencentDocsClient:\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        raise RuntimeError('secret-token-abc: 不允许真的联网')\n"
+            )
+        saved_module = sys.modules.pop("client", None)
+        saved_path = list(sys.path)
+        try:
+            with patch.object(custom_ui, "MCP_SERVER_DIR", tmp.name):
+                html = custom_ui.fetch_file_tree()
+        finally:
+            sys.path[:] = saved_path
+            sys.modules.pop("client", None)
+            if saved_module is not None:
+                sys.modules["client"] = saved_module
+            tmp.cleanup()
         self.assertNotIn("Traceback", html)
+        self.assertNotIn("secret-token-abc", html)
+        self.assertIn("文档树暂时获取失败", html)
 
 
 class TimeoutTests(unittest.IsolatedAsyncioTestCase):
@@ -488,3 +510,219 @@ class NoRawExceptionTests(unittest.IsolatedAsyncioTestCase):
         text = app._location_failure_text(located, SchedulePlan(intent="lookup", question="q"))
         self.assertNotIn("Traceback", text)
         self.assertIn("请稍后重试", text)
+
+
+class TruncationKeywordTests(unittest.TestCase):
+    def test_normal_notes_are_not_truncation(self):
+        for note in ("部分字段为空", "capacity planning", "前 3 列是关键列", "该表只读权限", "部分内容已更新"):
+            self.assertFalse(agent_types.is_truncation_note(note), note)
+
+    def test_real_truncation_notes_still_detected(self):
+        for note in (
+            "capped at 200 rows",
+            "result truncated",
+            "只读取了前 10 行（共 50 行），统计结果可能不完整。",
+            "仅读取前 10 行",
+            "统计结果可能不完整",
+        ):
+            self.assertTrue(agent_types.is_truncation_note(note), note)
+
+
+class LocatorCapHeuristicTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _chat(messages, tools, tool_choice):
+        return _decision("locate_decision", status="found", doc_title="订单表",
+                         sheet_hint="明细", candidates=[])
+
+    async def test_not_truncated_when_total_known_and_complete(self):
+        # analyze 意图 row_limit=4：收到 3 行数据 + 表头 == 总行数 4，
+        # 即使“收到行数 == 上限”也不算截断。
+        session = FakeSession({
+            "list_docs": {"list": [{"id": "f1", "title": "订单表"}]},
+            "list_sheets": {"list": [{"id": "s1", "title": "明细", "row_count": 4}]},
+            "search_and_read_sheet": {
+                "data": [["金额"], [1], [2], [3]],
+                "read_range": "A1:A4",
+                "rows_read": 4, "total_rows": 4, "truncated": False,
+            },
+        })
+        result = await DocLocatorAgent(chat=self._chat).run(
+            session, SchedulePlan(intent="analyze", question="合计", doc_hint="订单表", sheet_hint="明细"), ""
+        )
+        self.assertEqual(result.status, "found")
+        self.assertFalse(result.truncated)
+
+    async def test_truncated_when_total_unknown_and_at_cap(self):
+        session = FakeSession({
+            "list_docs": {"list": [{"id": "f1", "title": "订单表"}]},
+            "list_sheets": {"list": [{"id": "s1", "title": "明细"}]},
+            "search_and_read_sheet": {
+                "data": [["金额"], [1], [2], [3]],
+                "read_range": "A1:A4",
+            },
+        })
+        result = await DocLocatorAgent(chat=self._chat).run(
+            session, SchedulePlan(intent="analyze", question="合计", doc_hint="订单表", sheet_hint="明细"), ""
+        )
+        self.assertTrue(result.truncated)
+
+    async def test_payload_total_rows_used_when_sheet_count_unknown(self):
+        session = FakeSession({
+            "list_docs": {"list": [{"id": "f1", "title": "订单表"}]},
+            "list_sheets": {"list": [{"id": "s1", "title": "明细"}]},
+            "search_and_read_sheet": {
+                "data": [["金额"], [1], [2], [3]],
+                "read_range": "A1:A4",
+                "rows_read": 4, "total_rows": 4, "truncated": False,
+            },
+        })
+        result = await DocLocatorAgent(chat=self._chat).run(
+            session, SchedulePlan(intent="analyze", question="合计", doc_hint="订单表", sheet_hint="明细"), ""
+        )
+        self.assertFalse(result.truncated)
+
+
+class McpInitTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_mcp_session_raises_dedicated_timeout(self):
+        import mcp
+        import mcp.client.stdio
+
+        class SlowSession:
+            def __init__(self, read, write):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def initialize(self):
+                await asyncio.sleep(10)
+
+        @asynccontextmanager
+        async def fake_stdio_client(params):
+            yield (object(), object())
+
+        with patch.dict(os.environ, {"MCP_INIT_TIMEOUT_SECONDS": "0.05"}):
+            with patch.object(mcp, "ClientSession", SlowSession), \
+                 patch.object(mcp.client.stdio, "stdio_client", fake_stdio_client):
+                with self.assertRaises(app.McpInitTimeout) as ctx:
+                    async with app._open_mcp_session():
+                        pass
+        self.assertEqual(ctx.exception.seconds, 0.05)
+        self.assertIn("0.05", ctx.exception.user_message())
+        self.assertIn("连接文档服务超时", ctx.exception.user_message())
+
+    async def test_process_chat_shows_init_timeout_not_chat_timeout(self):
+        @asynccontextmanager
+        async def slow_opener():
+            await asyncio.sleep(0)
+            raise app.McpInitTimeout(30)
+            yield  # pragma: no cover
+
+        class Memory:
+            async def run(self, text, prior):
+                return SimpleNamespace(handled=False, updated=False, reply="")
+
+        class Scheduler:
+            async def run(self, text, prior, memory):
+                return SchedulePlan(intent="lookup", question="查订单", doc_hint="订单")
+
+        tmp = tempfile.TemporaryDirectory()
+        old_db = app.DB_FILE
+        app.DB_FILE = os.path.join(tmp.name, "chat.db")
+        app.configure_runtime(app.Runtime(
+            memory_agent=Memory(),
+            format_memory_prompt=lambda: "",
+            scheduler=Scheduler(),
+            open_mcp_session=slow_opener,
+        ))
+        try:
+            result = await app.process_chat("查订单", [])
+        finally:
+            app.configure_runtime(None)
+            app.DB_FILE = old_db
+            tmp.cleanup()
+        self.assertEqual(result, "连接文档服务超时（超过 30 秒），请稍后重试。")
+        self.assertNotIn("240", result)
+        self.assertNotIn("处理超时", result)
+
+    async def test_tool_timeout_message_shows_fired_seconds(self):
+        class SlowSession:
+            async def call_tool(self, name, arguments):
+                await asyncio.sleep(30)
+                return _McpResult({})
+
+        with patch.dict(os.environ, {"MCP_TIMEOUT_SECONDS": "0.05"}):
+            result = await agent_types.safe_mcp_call(
+                SlowSession(), "list_docs", {}, agent_types.LOCATOR_TOOL_NAMES, "scope"
+            )
+        self.assertIn("超过 0.05 秒", result.text)
+
+        with patch.dict(os.environ, {"MCP_TIMEOUT_SECONDS": "0.01", "ANALYSIS_TIMEOUT_SECONDS": "0.05"}):
+            result = await agent_types.safe_mcp_call(
+                SlowSession(), "analyze_sheet_pandas", {}, agent_types.ANALYST_TOOL_NAMES, "scope"
+            )
+        self.assertIn("超过 0.05 秒", result.text)
+
+    def test_analysis_timeout_default_is_90(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ANALYSIS_TIMEOUT_SECONDS", None)
+            self.assertEqual(agent_types.analysis_timeout_seconds(), 90.0)
+
+
+class IdsPassingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_analyst_passes_file_and_sheet_ids(self):
+        async def chat(messages, tools, tool_choice):
+            return _decision("analyze_sheet_pandas", doc_title="表", sheet_name="明细",
+                             python_code="print(df['金额'].sum())")
+
+        session = FakeSession({"analyze_sheet_pandas": {"code_output": "42"}})
+        located = LocatedResult(status="found", doc_title="表", file_id="f1",
+                                sheet_title="明细", sheet_id="s1", columns=["金额"])
+        result = await DataAnalystAgent(chat=chat).run(
+            session, SchedulePlan(intent="analyze", question="合计", calc_goal="求和"), located
+        )
+        self.assertEqual(result.status, "ok")
+        submitted = session.calls[0][1]
+        self.assertEqual(submitted["file_id"], "f1")
+        self.assertEqual(submitted["sheet_id"], "s1")
+
+    async def test_locator_passes_ids_to_search_and_read(self):
+        async def chat(messages, tools, tool_choice):
+            return _decision("locate_decision", status="found", doc_title="订单表",
+                             sheet_hint="明细", candidates=[])
+
+        session = FakeSession({
+            "list_docs": {"list": [{"id": "f1", "title": "订单表"}]},
+            "list_sheets": {"list": [{"id": "s1", "title": "明细", "row_count": 2}]},
+            "search_and_read_sheet": {"data": [["金额"], [12]], "read_range": "A1:A2"},
+        })
+        await DocLocatorAgent(chat=chat).run(
+            session, SchedulePlan(intent="lookup", question="查", doc_hint="订单表", sheet_hint="明细"), ""
+        )
+        name, args = session.calls[-1]
+        self.assertEqual(name, "search_and_read_sheet")
+        self.assertEqual(args["file_id"], "f1")
+        self.assertEqual(args["sheet_id"], "s1")
+
+    async def test_locator_fallback_read_sheet_uses_real_column_width(self):
+        async def chat(messages, tools, tool_choice):
+            return _decision("locate_decision", status="found", doc_title="订单表",
+                             sheet_hint="明细", candidates=[])
+
+        session = FakeSession({
+            "list_docs": {"list": [{"id": "f1", "title": "订单表"}]},
+            "list_sheets": {"list": [{"id": "s1", "title": "明细", "row_count": 2, "column_count": 5}]},
+            "search_and_read_sheet": {"error": "读取失败"},
+            "read_sheet": {"start_row": 0, "start_column": 0, "values": [["金额"], [12]]},
+        })
+        result = await DocLocatorAgent(chat=chat).run(
+            session, SchedulePlan(intent="lookup", question="查", doc_hint="订单表", sheet_hint="明细"), ""
+        )
+        self.assertEqual(result.status, "found")
+        read_calls = [args for name, args in session.calls if name == "read_sheet"]
+        self.assertEqual(len(read_calls), 1)
+        # 5 列 -> E，不再硬编码 AD
+        self.assertEqual(read_calls[0]["cell_range"], "A1:E21")

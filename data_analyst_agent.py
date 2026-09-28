@@ -68,6 +68,8 @@ ANALYZE_TOOL = function_tool(
         "doc_title": {"type": "string"},
         "python_code": {"type": "string"},
         "sheet_name": {"type": "string"},
+        "file_id": {"type": "string"},
+        "sheet_id": {"type": "string"},
     },
     ["doc_title", "python_code", "sheet_name"],
 )
@@ -165,6 +167,8 @@ class DataAnalystAgent:
                 "doc_title": located.doc_title,
                 "python_code": last_executed_code,
                 "sheet_name": located.sheet_title,
+                "file_id": located.file_id,
+                "sheet_id": located.sheet_id,
             }
             executed = await safe_mcp_call(
                 session,

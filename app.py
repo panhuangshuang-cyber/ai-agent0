@@ -49,6 +49,21 @@ ANALYST_FAILURE = "数据分析没有完成。"
 ANSWER_FAILURE = "已经定位到《{doc_title}》的「{sheet_title}」，但没有组织出回答。"
 
 
+class McpInitTimeout(Exception):
+    """MCP 会话初始化超时。
+
+    故意不继承 TimeoutError：避免被 process_chat 里针对整轮对话超时的
+    ``except TimeoutError`` 捕获后展示错误的秒数（240 秒 vs 实际 30 秒）。
+    """
+
+    def __init__(self, seconds: float):
+        super().__init__(f"MCP 会话初始化超时（超过 {seconds:g} 秒）")
+        self.seconds = seconds
+
+    def user_message(self) -> str:
+        return f"连接文档服务超时（超过 {self.seconds:g} 秒），请稍后重试。"
+
+
 def configure_logging() -> None:
     """配置根日志（只在 __main__ 启动时调用）。"""
     level_name = str(os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
@@ -163,7 +178,7 @@ async def _open_mcp_session() -> AsyncIterator[Any]:
                 await asyncio.wait_for(session.initialize(), init_timeout)
             except (asyncio.TimeoutError, TimeoutError) as exc:
                 logging.warning("MCP 会话初始化超时（超过 %s 秒）", init_timeout)
-                raise TimeoutError("MCP 会话初始化超时，请稍后重试。") from exc
+                raise McpInitTimeout(init_timeout) from exc
             yield session
 
 
@@ -202,6 +217,12 @@ def _location_failure_text(located: LocatedResult, plan: SchedulePlan) -> str:
 async def process_chat(user_input: Any, history: Any) -> str:
     try:
         return await asyncio.wait_for(_process_chat_inner(user_input, history), chat_timeout_seconds())
+    except McpInitTimeout as exc:
+        logging.warning("MCP 会话初始化超时（超过 %s 秒）", exc.seconds)
+        message = exc.user_message()
+        prior_text = normalize_text(extract_text(user_input))
+        _safe_log_to_db(prior_text, message)
+        return message
     except (asyncio.TimeoutError, TimeoutError):
         logging.warning("整轮对话超时，已停止本次查询")
         prior_text = normalize_text(extract_text(user_input))
@@ -290,6 +311,9 @@ async def _process_chat_inner(user_input: Any, history: Any) -> str:
             return deliver(text)
     except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
         # 超时/取消：让外层统一返回超时文案；async with 已关闭 MCP 子进程。
+        raise
+    except McpInitTimeout:
+        # 初始化超时秒数与整轮超时不同，交给 process_chat 展示真实秒数。
         raise
     except Exception:
         logging.exception("MCP session failed")

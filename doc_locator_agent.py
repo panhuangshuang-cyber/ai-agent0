@@ -206,18 +206,27 @@ class DocLocatorAgent:
                 "sheet_name": sheet["title"],
                 "max_rows": row_limit,
                 "max_cols": 30,
+                "file_id": doc["id"],
+                "sheet_id": sheet["id"],
             },
             LOCATOR_TOOL_NAMES,
             LOCATOR_SCOPE_REJECTION,
         )
         if not read_call.ok:
+            # 回退 read_sheet 时按真实列数取范围（不再硬编码 AD=30 列）。
+            column_count = sheet.get("column_count") or 30
+            try:
+                column_count = int(column_count)
+            except (TypeError, ValueError):
+                column_count = 30
+            column_count = max(1, min(column_count, 30))
             read_call = await safe_mcp_call(
                 session,
                 "read_sheet",
                 {
                     "file_id": doc["id"],
                     "sheet_id": sheet["id"],
-                    "cell_range": f"A1:AD{row_limit}",
+                    "cell_range": f"A1:{_col_letter(column_count - 1)}{row_limit}",
                 },
                 LOCATOR_TOOL_NAMES,
                 LOCATOR_SCOPE_REJECTION,
@@ -247,21 +256,24 @@ class DocLocatorAgent:
                         break
                 except (TypeError, ValueError):
                     continue
-        # “收到行数 == 上限”且总数未知时视为可能截断；总数已知时以总数为准；
-        # payload 明确说被封顶时永远标记截断。
+        # 截断判定：
+        # - 服务端明确标记（truncated/has_more/note 封顶字样）时永远截断；
+        # - 总数已知且“收到数据行 + 表头 == 总数”时视为完整读取，
+        #   不能仅因为“收到行数 == 读取上限”就判定截断；
+        # - “收到行数 == 上限”的封顶启发式只在总数未知时生效。
         at_cap = data_rows_returned >= max(0, row_limit - 1)
-        payload_says_capped = is_truncation_note_local(payload.get("note"))
-        truncated = bool(
+        server_flag = bool(
             payload.get("truncated")
             or payload.get("has_more")
-            or payload_truncated
-            or payload_says_capped
-            or (total_known is not None and total_known > data_rows_returned + 1)
-            or (total_known is None and at_cap)
+            or is_truncation_note_local(payload.get("note"))
         )
+        complete_by_total = total_known is not None and data_rows_returned + 1 >= total_known
+        cap_hit = at_cap or payload_truncated
+        truncated = server_flag or (not complete_by_total and (cap_hit or total_known is not None))
         read_range = clean_text(payload.get("read_range") or payload.get("range"))
         if not read_range:
-            read_range = f"A1:AD{min(row_limit, len(rows) + 1)}"
+            fallback_cols = max(1, min(len(columns) or 30, 30))
+            read_range = f"A1:{_col_letter(fallback_cols - 1)}{min(row_limit, len(rows) + 1)}"
         note = clean_text(payload.get("note"))
         if truncated and not note:
             if total_known is not None:
@@ -327,6 +339,18 @@ def _extract_docs(payload: Any) -> list[dict[str, str]]:
     return result
 
 
+def _col_letter(index: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA …（列号转 A1 表示法字母）。"""
+    letter = ""
+    n = max(0, int(index))
+    while True:
+        letter = chr(n % 26 + 65) + letter
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return letter
+
+
 def _extract_sheets(payload: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for item in _unwrap_list(payload, ("list", "sheets", "worksheets", "items", "data")):
@@ -341,8 +365,13 @@ def _extract_sheets(payload: Any) -> list[dict[str, Any]]:
             count = int(count) if count is not None and count != "" else None
         except (TypeError, ValueError):
             count = None
+        column_count = item.get("column_count", item.get("columnCount", item.get("colCount")))
+        try:
+            column_count = int(column_count) if column_count is not None and column_count != "" else None
+        except (TypeError, ValueError):
+            column_count = None
         if title and sheet_id:
-            result.append({"title": title, "id": sheet_id, "row_count": count})
+            result.append({"title": title, "id": sheet_id, "row_count": count, "column_count": column_count})
     return result
 
 
