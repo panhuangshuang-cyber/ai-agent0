@@ -207,6 +207,10 @@ def _location_failure_text(located: LocatedResult, plan: SchedulePlan) -> str:
     if located.status == "not_found":
         if located.doc_title and plan.sheet_hint:
             return f"在《{located.doc_title}》里没有找到你说的子表“{plan.sheet_hint}”。请确认子表名。"
+        available = [item for item in (located.available or []) if item][:10]
+        if available:
+            listing = "、".join(f"《{item}》" for item in available)
+            return f"没有找到你说的“{plan.doc_hint}”。现有表格有：{listing}。请告诉我要查哪一份。"
         return f"在最多 100 份表格里没有找到你说的“{plan.doc_hint}”。请确认文档名或提供更完整的标题。"
     # error 状态：只展示友好 note，绝不展示异常原文。
     if located.note:

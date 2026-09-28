@@ -780,3 +780,166 @@ class RealTencentPayloadShapeTests(unittest.TestCase):
                                "columnCount": 0, "rowTotal": 197, "columnTotal": 26}]}
         sheets = _extract_sheets(payload)
         self.assertEqual(sheets, [{"title": "工作表1", "id": "BB08J2", "row_count": 197, "column_count": 26}])
+
+
+class InformalDocHintTests(unittest.IsolatedAsyncioTestCase):
+    """线上实测：用户说“板材那个表”，调度器按设计原样保留 hint，
+    定位必须给出候选，而不是直接回“没有找到”。"""
+
+    TITLES = ["tx", "封边条250424", "板材250424", "板材库存"]
+
+    def _session(self):
+        docs = {"list": [{"id": "f%d" % index, "title": title}
+                         for index, title in enumerate(self.TITLES)]}
+        return FakeSession({
+            "list_docs": docs,
+            "list_sheets": {"list": [{"id": "s1", "title": "工作表1", "row_count": 2}]},
+            "search_and_read_sheet": {"data": [["数量"], [12]], "read_range": "A1:A2"},
+        })
+
+    async def _locate(self, doc_hint, chat, memory=""):
+        return await DocLocatorAgent(chat=chat).run(
+            self._session(),
+            SchedulePlan(intent="lookup", question="有哪些列", doc_hint=doc_hint),
+            memory,
+        )
+
+    async def test_partial_hint_returns_candidates_without_llm(self):
+        async def chat(messages, tools, tool_choice):
+            raise AssertionError("ambiguous must not call LLM")
+
+        plan = SchedulePlan(intent="lookup", question="有哪些列", doc_hint="板材那个表")
+        result = await DocLocatorAgent(chat=chat).run(self._session(), plan, "")
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(result.candidates, ["板材250424", "板材库存"])
+        text = app._location_failure_text(result, plan)
+        self.assertIn("《板材250424》、《板材库存》", text)
+
+    async def test_partial_hint_single_match_is_found(self):
+        async def chat(messages, tools, tool_choice):
+            return _decision("locate_decision", status="found", doc_title="封边条250424",
+                             sheet_hint="", candidates=[])
+
+        result = await self._locate("封边条那个表格", chat)
+        self.assertEqual(result.status, "found")
+        self.assertEqual(result.doc_title, "封边条250424")
+
+    async def test_exact_title_still_wins_over_substring(self):
+        async def chat(messages, tools, tool_choice):
+            return _decision("locate_decision", status="found", doc_title="板材库存",
+                             sheet_hint="", candidates=[])
+
+        session = self._session()
+        result = await DocLocatorAgent(chat=chat).run(
+            session, SchedulePlan(intent="lookup", question="查", doc_hint="板材库存"), ""
+        )
+        self.assertEqual(result.status, "found")
+        self.assertEqual(result.doc_title, "板材库存")
+        sheet_calls = [args for name, args in session.calls if name == "list_sheets"]
+        self.assertEqual(sheet_calls[0]["file_id"], "f3")
+
+    async def test_memory_alias_beats_fuzzy_matching(self):
+        async def chat(messages, tools, tool_choice):
+            return _decision("locate_decision", status="found", doc_title="板材库存",
+                             sheet_hint="", candidates=[])
+
+        result = await self._locate(
+            "测试文档", chat, memory="- 当用户提到 测试文档，等同于 板材库存"
+        )
+        self.assertEqual(result.status, "found")
+        self.assertEqual(result.doc_title, "板材库存")
+
+    async def test_generic_hints_do_not_match_everything(self):
+        async def chat(messages, tools, tool_choice):
+            raise AssertionError("not_found must not call LLM")
+
+        for hint in ("表", "那个表格"):
+            result = await self._locate(hint, chat)
+            self.assertEqual(result.status, "not_found", hint)
+            self.assertEqual(result.candidates, [], hint)
+            self.assertEqual(result.available, self.TITLES, hint)
+            text = app._location_failure_text(
+                result, SchedulePlan(intent="lookup", question="查", doc_hint=hint)
+            )
+            self.assertIn("《tx》、《封边条250424》、《板材250424》、《板材库存》", text)
+
+    def test_fallback_ignores_generic_and_short_numeric_cores(self):
+        from doc_locator_agent import _fuzzy_matches
+        for hint in ("25", "表", "那个表格"):
+            self.assertEqual(_fuzzy_matches(self.TITLES, hint), [], hint)
+        # “25”本身仍是两张表标题的子串，保持原有的子串语义不变。
+        self.assertEqual(
+            _contains_matches(self.TITLES, "25"), ["封边条250424", "板材250424"]
+        )
+
+    async def test_shorter_title_still_not_matched_by_longer_hint(self):
+        async def chat(messages, tools, tool_choice):
+            raise AssertionError("not_found must not call LLM")
+
+        session = FakeSession({"list_docs": {"list": [{"id": "f1", "title": "销售"}]}})
+        plan = SchedulePlan(intent="lookup", question="查", doc_hint="销售存档")
+        result = await DocLocatorAgent(chat=chat).run(session, plan, "")
+        self.assertEqual(result.status, "not_found")
+        self.assertEqual(result.available, ["销售"])
+        self.assertIn("《销售》", app._location_failure_text(result, plan))
+
+
+class AnalystFailureLogTests(unittest.IsolatedAsyncioTestCase):
+    """线上 app.log 只看到 attempt=2 ok=True，看不到第一次为什么失败。"""
+
+    @staticmethod
+    def _located():
+        return LocatedResult(status="found", doc_title="表", sheet_title="明细", columns=["金额"])
+
+    async def test_validator_rejection_reason_is_logged(self):
+        replies = [
+            _decision("analyze_sheet_pandas", doc_title="表", sheet_name="明细",
+                      python_code="import os\nprint(1)"),
+            _decision("analyze_sheet_pandas", doc_title="表", sheet_name="明细",
+                      python_code="print(df['金额'].sum())"),
+        ]
+
+        async def chat(messages, tools, tool_choice):
+            return replies.pop(0)
+
+        session = FakeSession({"analyze_sheet_pandas": {"code_output": "10"}})
+        with self.assertLogs(level="INFO") as captured:
+            result = await DataAnalystAgent(chat=chat).run(
+                session, SchedulePlan(intent="analyze", question="合计", calc_goal="求和"), self._located()
+            )
+        self.assertEqual(result.status, "ok")
+        joined = "\n".join(captured.output)
+        self.assertIn("agent=analyst attempt=1 failed reason=", joined)
+        self.assertIn("import", joined)
+        self.assertNotIn("agent=analyst attempt=2 failed", joined)
+
+    async def test_tool_error_reason_is_logged_single_line_and_clipped(self):
+        long_error = "执行代码出错：列不存在\n" + "长" * 400
+
+        async def chat(messages, tools, tool_choice):
+            return _decision("analyze_sheet_pandas", doc_title="表", sheet_name="明细",
+                             python_code="print(df['金额'].sum())")
+
+        session = FakeSession({"analyze_sheet_pandas": {"error": long_error}})
+        with self.assertLogs(level="INFO") as captured:
+            result = await DataAnalystAgent(chat=chat).run(
+                session, SchedulePlan(intent="analyze", question="合计", calc_goal="求和"), self._located()
+            )
+        self.assertEqual(result.status, "error")
+        reasons = [line for line in captured.output if "failed reason=" in line]
+        self.assertEqual(len(reasons), 3)
+        for line in reasons:
+            self.assertNotIn("\n", line)
+            self.assertIn("列不存在", line)
+            self.assertLessEqual(len(line), 260)
+            self.assertNotIn(long_error, line)
+
+
+
+class ShortTitleFuzzyTests(unittest.TestCase):
+    def test_short_exact_title_after_stripping_fillers(self):
+        from doc_locator_agent import _fuzzy_matches
+        titles = ["tx", "封边条250424", "板材250424", "板材库存"]
+        self.assertEqual(_fuzzy_matches(titles, "tx那个表"), ["tx"])
+        self.assertEqual(_fuzzy_matches(titles, "那个表"), [])
+        self.assertEqual(_fuzzy_matches(titles, "25"), [])

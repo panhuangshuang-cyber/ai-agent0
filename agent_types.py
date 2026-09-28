@@ -100,6 +100,8 @@ class LocatedResult:
     truncated: bool = False
     candidates: list[str] = field(default_factory=list)
     note: str = ""
+    #: not_found 时可展示的现有文档标题（最多 10 份），帮助用户改口。
+    available: list[str] = field(default_factory=list)
 
 
 @dataclass

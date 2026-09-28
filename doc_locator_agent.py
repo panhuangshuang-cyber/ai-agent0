@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Awaitable, Callable, Iterable
 
 from agent_types import (
@@ -89,6 +90,9 @@ class DocLocatorAgent:
             deterministic = narrowed or preferred
         else:
             deterministic = preferred if preferred else fallback
+        if not deterministic:
+            # 用户口语化的说法（“板材那个表”）不含完整标题，去掉指示词/量词后再匹配。
+            deterministic = _fuzzy_matches(titles, formal_hint) or _fuzzy_matches(titles, plan.doc_hint)
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -107,7 +111,7 @@ class DocLocatorAgent:
             # 0 个（not_found）或多个（ambiguous）时不需要再问模型，直接返回。
             if len(deterministic) > 1:
                 return LocatedResult(status="ambiguous", candidates=deterministic)
-            return LocatedResult(status="not_found")
+            return LocatedResult(status="not_found", available=titles[:10])
 
         selected_title = deterministic[0]
         model_sheet_hint = ""
@@ -146,7 +150,7 @@ class DocLocatorAgent:
         if decision is not None:
             model_sheet_hint = clean_text(decision.get("sheet_hint"))
             if clean_text(decision.get("doc_title")) != selected_title:
-                return LocatedResult(status="not_found")
+                return LocatedResult(status="not_found", available=titles[:10])
         doc = next(item for item in docs if item["title"] == selected_title)
 
         sheets_call = await safe_mcp_call(
@@ -429,6 +433,87 @@ def _contains_matches(titles: list[str], hint: str) -> list[str]:
     if exact is not None:
         return [exact]
     return [title for title in titles if _contains(title, hint)]
+
+
+#: 口语化指代词，按“长的先删”排序，避免先删掉 表 而留下 格。
+_FILLER_WORDS = (
+    "工作簿",
+    "sheet",
+    "里面",
+    "那个", "这个", "那张", "这张", "那份", "这份",
+    "表格", "文档", "文件", "在线", "腾讯", "名为",
+    "的", "里", "中", "叫", "表",
+)
+
+_PUNCTUATION_RE = re.compile(r"[\s《》〈〉「」“”‘’\"']+")
+
+#: 两位以内的纯数字/字母（例如 "25"）不足以区分文档名，不能当核心词。
+_SHORT_ASCII_RE = re.compile(r"^[0-9a-z]{1,2}$")
+
+
+def _usable_core(core: str) -> bool:
+    return len(core) >= 2 and _SHORT_ASCII_RE.match(core) is None
+
+
+def _core_chain(hint: str) -> list[str]:
+    """逐轮删掉指代词，返回从“最完整”到“最精简”的候选核心词。"""
+    text = _PUNCTUATION_RE.sub("", clean_text(hint).casefold())
+    chain: list[str] = []
+    while True:
+        if _usable_core(text) and text not in chain:
+            chain.append(text)
+        before = text
+        for word in _FILLER_WORDS:
+            if word in text:
+                text = text.replace(word, "")
+                break
+        if text == before:
+            return chain
+
+
+def _shared_core_matches(titles: list[str], core: str) -> list[str]:
+    """标题与核心词有长度 >= 2 的公共子串即算候选（最长的公共片段优先）。
+
+    标题整体只是核心词的子串时不算命中，保持 title="销售"、hint="销售存档"
+    不匹配的原有语义。
+    """
+    core_norm = core.casefold()
+    for size in range(len(core_norm) - 1, 1, -1):
+        fragments = {core_norm[i:i + size] for i in range(len(core_norm) - size + 1)}
+        fragments = {item for item in fragments if _usable_core(item)}
+        if not fragments:
+            continue
+        matched = []
+        for title in titles:
+            title_norm = clean_text(title).casefold()
+            if not title_norm or title_norm in core_norm:
+                continue
+            if any(fragment in title_norm for fragment in fragments):
+                matched.append(title)
+        if matched:
+            return matched
+    return []
+
+
+def _fuzzy_matches(titles: list[str], hint: str) -> list[str]:
+    """精确/子串都没命中时的兜底：去掉“那个表”这类指代词后再匹配。"""
+    chain = _core_chain(hint)
+    # 短核心词（如 "tx"）不参与模糊匹配，但若它恰好等于某个标题则直接命中。
+    text = _PUNCTUATION_RE.sub("", clean_text(hint).casefold())
+    for word in _FILLER_WORDS:
+        text = text.replace(word, "")
+    exact = _exact_match(titles, text) if text else None
+    if exact is not None:
+        return [exact]
+    for core in chain:
+        matches = _contains_matches(titles, core)
+        if matches:
+            return matches
+    for core in chain:
+        matches = _shared_core_matches(titles, core)
+        if matches:
+            return matches
+    return []
 
 
 doc_locator_agent = DocLocatorAgent()
