@@ -15,21 +15,49 @@ import sqlite3
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Callable
 
-from agent_types import AnalysisResult, LocatedResult, SchedulePlan, clean_text
+from agent_types import (
+    AnalysisResult,
+    LocatedResult,
+    SchedulePlan,
+    chat_timeout_message,
+    chat_timeout_seconds,
+    clean_text,
+    extract_text,
+    mcp_init_timeout_seconds,
+)
 from answer_agent import answer_agent
 from data_analyst_agent import data_analyst_agent
 from doc_locator_agent import doc_locator_agent
 from scheduler_agent import scheduler_agent
 
 
-DB_FILE = "/home/ubuntu/tencent-docs-web/chat_history.db"
-MCP_SERVER_SCRIPT = "/home/ubuntu/tencent-docs-mcp/server.py"
-MCP_PYTHON_BIN = "/home/ubuntu/tencent-docs-mcp/.venv/bin/python"
+def _env(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None or not str(value).strip():
+        return default
+    return str(value)
+
+
+DB_FILE = _env("CHAT_DB_FILE", "/home/ubuntu/tencent-docs-web/chat_history.db")
+MCP_SERVER_SCRIPT = _env("MCP_SERVER_SCRIPT", "/home/ubuntu/tencent-docs-mcp/server.py")
+MCP_PYTHON_BIN = _env("MCP_PYTHON_BIN", "/home/ubuntu/tencent-docs-mcp/.venv/bin/python")
+SQLITE_CONNECT_TIMEOUT_SECONDS = 10.0
 
 SCHEDULER_FAILURE = "这轮没有分清是闲聊还是查表，没有查文档。"
 LOCATOR_FAILURE = "文档列表没有取到，这轮没有查表。"
 ANALYST_FAILURE = "数据分析没有完成。"
 ANSWER_FAILURE = "已经定位到《{doc_title}》的「{sheet_title}」，但没有组织出回答。"
+
+
+def configure_logging() -> None:
+    """配置根日志（只在 __main__ 启动时调用）。"""
+    level_name = str(os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
 
 
 @dataclass
@@ -70,10 +98,14 @@ def normalize_text(value: Any) -> str:
 
 
 def log_to_db(user_text: str, assistant_text: str) -> None:
-    parent = os.path.dirname(DB_FILE)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(DB_FILE)
+    try:
+        parent = os.path.dirname(DB_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        conn = sqlite3.connect(DB_FILE, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS)
+    except Exception:
+        logging.exception("写入聊天记录失败")
+        return
     try:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS chat_history ("
@@ -96,8 +128,21 @@ def log_to_db(user_text: str, assistant_text: str) -> None:
             (normalize_text(user_text), assistant_text),
         )
         conn.commit()
+    except Exception:
+        logging.exception("写入聊天记录失败")
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            logging.exception("关闭聊天记录连接失败")
+
+
+def _safe_log_to_db(user_text: str, assistant_text: str) -> None:
+    """写库失败也不丢掉正常回复。"""
+    try:
+        log_to_db(user_text, assistant_text)
+    except Exception:
+        logging.exception("写入聊天记录失败")
 
 
 @asynccontextmanager
@@ -110,9 +155,15 @@ async def _open_mcp_session() -> AsyncIterator[Any]:
         args=[MCP_SERVER_SCRIPT],
         env=dict(os.environ),
     )
+    init_timeout = mcp_init_timeout_seconds()
+    # 超时/取消时 async with 会自动关闭 MCP 子进程。
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
-            await session.initialize()
+            try:
+                await asyncio.wait_for(session.initialize(), init_timeout)
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                logging.warning("MCP 会话初始化超时（超过 %s 秒）", init_timeout)
+                raise TimeoutError("MCP 会话初始化超时，请稍后重试。") from exc
             yield session
 
 
@@ -122,12 +173,13 @@ def _history_messages(history: Any) -> tuple[list[dict[str, str]], str]:
         if isinstance(item, dict):
             role = item.get("role", "user")
             if role in {"user", "assistant"}:
-                messages.append({"role": role, "content": normalize_text(item.get("content", ""))})
+                text = extract_text(item.get("content", ""))
+                messages.append({"role": role, "content": normalize_text(text)})
         elif isinstance(item, (list, tuple)) and len(item) == 2:
-            if item[0]:
-                messages.append({"role": "user", "content": normalize_text(item[0])})
-            if item[1]:
-                messages.append({"role": "assistant", "content": normalize_text(item[1])})
+            if item[0] not in (None, ""):
+                messages.append({"role": "user", "content": normalize_text(extract_text(item[0]))})
+            if item[1] not in (None, ""):
+                messages.append({"role": "assistant", "content": normalize_text(extract_text(item[1]))})
     return messages, ""
 
 
@@ -141,13 +193,31 @@ def _location_failure_text(located: LocatedResult, plan: SchedulePlan) -> str:
         if located.doc_title and plan.sheet_hint:
             return f"在《{located.doc_title}》里没有找到你说的子表“{plan.sheet_hint}”。请确认子表名。"
         return f"在最多 100 份表格里没有找到你说的“{plan.doc_hint}”。请确认文档名或提供更完整的标题。"
+    # error 状态：只展示友好 note，绝不展示异常原文。
+    if located.note:
+        return located.note
     return LOCATOR_FAILURE
 
 
 async def process_chat(user_input: Any, history: Any) -> str:
+    try:
+        return await asyncio.wait_for(_process_chat_inner(user_input, history), chat_timeout_seconds())
+    except (asyncio.TimeoutError, TimeoutError):
+        logging.warning("整轮对话超时，已停止本次查询")
+        prior_text = normalize_text(extract_text(user_input))
+        _safe_log_to_db(prior_text, chat_timeout_message())
+        return chat_timeout_message()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("process_chat failed")
+        return "抱歉，这次处理出错了，请稍后重试。"
+
+
+async def _process_chat_inner(user_input: Any, history: Any) -> str:
     runtime = _get_runtime()
     prior, _ = _history_messages(history)
-    clean_user_input = normalize_text(user_input)
+    clean_user_input = normalize_text(extract_text(user_input))
 
     try:
         mem = await runtime.memory_agent.run(clean_user_input, prior[-6:])
@@ -156,7 +226,7 @@ async def process_chat(user_input: Any, history: Any) -> str:
         mem = SimpleNamespace(handled=False, updated=False, reply="")
 
     if mem.handled:
-        log_to_db(user_input, mem.reply)
+        _safe_log_to_db(user_input, mem.reply)
         return mem.reply
 
     memory_note = str(mem.reply or "").strip()
@@ -166,7 +236,7 @@ async def process_chat(user_input: Any, history: Any) -> str:
         if memory_note:
             body = body.replace(memory_note, "").strip()
             body = memory_note + ("\n\n" + body if body else "")
-        log_to_db(user_input, body)
+        _safe_log_to_db(user_input, body)
         return body
 
     memory_text = runtime.format_memory_prompt()
@@ -214,7 +284,13 @@ async def process_chat(user_input: Any, history: Any) -> str:
                 )
                 if plan.intent == "analyze" and analysis and analysis.output:
                     text += "\n\n" + analysis.output[:4000]
+                if plan.intent == "analyze" and analysis and getattr(analysis, "partial_note", ""):
+                    if analysis.partial_note not in text:
+                        text += "\n\n" + analysis.partial_note
             return deliver(text)
+    except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
+        # 超时/取消：让外层统一返回超时文案；async with 已关闭 MCP 子进程。
+        raise
     except Exception:
         logging.exception("MCP session failed")
         return deliver(LOCATOR_FAILURE)
@@ -227,6 +303,7 @@ def chat_interface(message, history):
 if __name__ == "__main__":
     from custom_ui import build_ui, custom_css
 
+    configure_logging()
     demo = build_ui(chat_interface)
     demo.queue(default_concurrency_limit=2)
     demo.launch(

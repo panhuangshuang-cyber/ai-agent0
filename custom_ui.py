@@ -1,5 +1,9 @@
+import logging
+import os
 import re
 import json
+
+MCP_SERVER_DIR = os.getenv("MCP_SERVER_DIR", "/home/ubuntu/tencent-docs-mcp")
 
 custom_css = """
 /* 隐藏页脚 */
@@ -19,8 +23,8 @@ textarea { font-size: 16px !important; }
 
 def fetch_file_tree():
     import sys, os
-    if "/home/ubuntu/tencent-docs-mcp" not in sys.path:
-        sys.path.append("/home/ubuntu/tencent-docs-mcp")
+    if MCP_SERVER_DIR not in sys.path:
+        sys.path.append(MCP_SERVER_DIR)
     try:
         from client import TencentDocsClient
         client = TencentDocsClient(
@@ -61,54 +65,113 @@ def fetch_file_tree():
             
         html += "</ul></div>"
         return html
-    except Exception as e:
-        return f"<div style='padding:10px;color:red;'>获取文档树失败: {str(e)}</div>"
+    except Exception:
+        logging.exception("获取文档树失败")
+        return "<div style='padding:10px;color:red;'>文档树暂时获取失败，请稍后刷新。</div>"
 
-def extract_text(content):
+def _extract_text_fallback(content):
+    """兼容旧实现：保持同名内部逻辑，实际走共享的 agent_types.extract_text。"""
+    try:
+        from agent_types import extract_text as _shared_extract
+        return _shared_extract(content)
+    except Exception:
+        pass
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        texts = []
-        for part in content:
-            if isinstance(part, dict) and "text" in part:
-                texts.append(part["text"])
-            elif isinstance(part, str):
-                texts.append(part)
-        return "".join(texts)
-    return str(content) if content is not None else ""
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+        nested = content.get("content", content.get("value"))
+        if isinstance(nested, (str, list, tuple, dict)):
+            return _extract_text_fallback(nested)
+        return ""
+    if isinstance(content, (list, tuple)):
+        return "".join(_extract_text_fallback(part) for part in content)
+    return str(content)
+
+
+extract_text = _extract_text_fallback
+
+
+def to_chatbot_content(text):
+    """Gradio 6.x Chatbot 输出 content 必须用 list-of-parts 形式。"""
+    return [{"type": "text", "text": str(text or "")}]
+
+
+def to_chatbot_history(history):
+    """把任意历史规整为 Gradio 6 合法的消息 dict 列表（content 为 list）。"""
+    normalized = []
+    for item in history or []:
+        if isinstance(item, dict):
+            role = item.get("role", "assistant")
+            if role not in ("user", "assistant", "system"):
+                role = "assistant"
+            entry = {"role": role, "content": to_chatbot_content(extract_text(item.get("content")))}
+            for key in ("metadata", "options"):
+                if item.get(key) is not None:
+                    entry[key] = item[key]
+            normalized.append(entry)
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            normalized.append({"role": "user", "content": to_chatbot_content(extract_text(item[0]))})
+            normalized.append({"role": "assistant", "content": to_chatbot_content(extract_text(item[1]))})
+    return normalized
+
+
+def append_message(history, role, text):
+    """不修改原列表，返回追加一条合法消息后的新列表。"""
+    base = to_chatbot_history(history)
+    base.append({"role": role, "content": to_chatbot_content(text)})
+    return base
+
+
+def user_input_handler(user_message, history):
+    history = append_message(history, "user", user_message)
+    return "", history
+
+
+def bot_response(history, _chat_fn=None):
+    from copy import deepcopy
+    history = to_chatbot_history(history)
+    if not history:
+        yield history
+        return
+
+    last_item = history[-1]
+    raw_msg = last_item.get("content", "") if isinstance(last_item, dict) else getattr(last_item, "content", "")
+    user_message = extract_text(raw_msg)
+    hist_api = deepcopy(history[:-1])
+
+    # 立即追加助手占位状态，避免界面空转假死
+    history = history + [{"role": "assistant", "content": to_chatbot_content("🤔 正在分析处理，正在调用相关文档接口...")}]
+    yield history
+
+    chat = _chat_fn or chat_fn_ref.get("fn")
+    try:
+        response = chat(user_message, hist_api) if chat else ""
+    except Exception:
+        logging.exception("聊天处理失败")
+        response = "抱歉，这次处理出错了，请稍后重试。"
+
+    updated = [dict(item) for item in history]
+    updated[-1] = {**updated[-1], "content": to_chatbot_content(response)}
+    yield updated
+
+chat_fn_ref: dict = {"fn": None}
+
 
 def build_ui(chat_fn):
     import gradio as gr
-    import asyncio
-    
-    def bot_response(history):
-        history = history or []
-        if not history:
-            yield history
-            return
-        
-        last_item = history[-1]
-        raw_msg = last_item.get("content", "") if isinstance(last_item, dict) else getattr(last_item, "content", "")
-        user_message = extract_text(raw_msg)
-        hist_api = history[:-1]
-        
-        # 立即追加助手占位状态，避免界面空转假死
-        history.append({"role": "assistant", "content": "🤔 正在分析处理，正在调用相关文档接口..."})
-        yield history
-        
-        try:
-            response = chat_fn(user_message, hist_api)
-        except Exception as e:
-            response = f"发生错误: {e}"
-            
-        history[-1]["content"] = response
-        yield history
 
+    chat_fn_ref["fn"] = chat_fn
 
-    def user_input_handler(user_message, history):
-        history = history or []
-        history.append({"role": "user", "content": user_message})
-        return "", history
+    def _user_input_handler(user_message, history):
+        return user_input_handler(user_message, history)
+
+    def _bot_response(history):
+        yield from bot_response(history, _chat_fn=chat_fn)
 
     with gr.Blocks(title="腾讯文档智能助手", fill_height=True) as demo:
         with gr.Row():
@@ -147,11 +210,11 @@ def build_ui(chat_fn):
         refresh_btn.click(fetch_file_tree, inputs=None, outputs=file_tree)
         
         # 聊天事件绑定 (支持回车和点击发送，设置并发度为 2 防止内存超限)
-        txt.submit(user_input_handler, [txt, chatbot], [txt, chatbot]).then(
-            bot_response, chatbot, chatbot, concurrency_limit=2
+        txt.submit(_user_input_handler, [txt, chatbot], [txt, chatbot]).then(
+            _bot_response, chatbot, chatbot, concurrency_limit=2
         )
-        submit_btn.click(user_input_handler, [txt, chatbot], [txt, chatbot]).then(
-            bot_response, chatbot, chatbot, concurrency_limit=2
+        submit_btn.click(_user_input_handler, [txt, chatbot], [txt, chatbot]).then(
+            _bot_response, chatbot, chatbot, concurrency_limit=2
         )
         
     return demo

@@ -7,6 +7,7 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from agent_types import (
+    ANALYSIS_READ_LIMIT_ROWS,
     ANALYST_SCOPE_REJECTION,
     ANALYST_TOOL_NAMES,
     AnalysisResult,
@@ -24,6 +25,40 @@ from agent_types import (
     tool_result_message,
     validate_analysis_code,
 )
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _partial_info(payload: dict[str, Any], located: LocatedResult) -> tuple[bool, str]:
+    """分析 payload 是否只读了部分行。"""
+    rows_read = _as_int(payload.get("rows_read"))
+    total_rows = _as_int(payload.get("total_rows"))
+    truncated = bool(payload.get("truncated"))
+    if total_rows is None and located.sheet_row_count:
+        total_rows = _as_int(located.sheet_row_count)
+    if rows_read is None and total_rows is not None and truncated:
+        rows_read = min(total_rows, ANALYSIS_READ_LIMIT_ROWS)
+    partial = bool(
+        truncated
+        or (rows_read is not None and total_rows is not None and rows_read < total_rows)
+        or (total_rows is not None and total_rows > ANALYSIS_READ_LIMIT_ROWS)
+    )
+    if not partial:
+        return False, ""
+    if rows_read is not None and total_rows is not None:
+        note = f"注意：表格只读取了前 {rows_read} 行（共 {total_rows} 行），统计结果可能不完整。"
+    elif total_rows is not None:
+        note = f"注意：表格只读取了前 {ANALYSIS_READ_LIMIT_ROWS} 行（共 {total_rows} 行），统计结果可能不完整。"
+    else:
+        note = "注意：表格只读取了前部分行，统计结果可能不完整。"
+    return True, note
 
 
 ANALYZE_TOOL = function_tool(
@@ -143,11 +178,13 @@ class DataAnalystAgent:
             if output is None:
                 output = executed.text
             last_output = clip_text(output, 4000)
+            error_value = payload.get("error") if isinstance(payload, dict) else None
             has_error = (
                 not executed.ok
-                or (isinstance(payload, dict) and "error" in payload)
+                or bool(error_value)
                 or last_output.startswith("执行代码出错")
             )
+            partial, partial_note = _partial_info(payload, located)
             logging.info("agent=analyst tool=%s attempt=%s ok=%s", name, attempts, not has_error)
             if not has_error:
                 return AnalysisResult(
@@ -157,6 +194,8 @@ class DataAnalystAgent:
                     code=last_executed_code,
                     output=last_output,
                     attempts=attempts,
+                    partial=partial,
+                    partial_note=partial_note,
                 )
             messages.append(assistant_tool_message(message))
             messages.append(tool_result_message(call, name, last_output or "分析执行失败"))
@@ -168,6 +207,8 @@ class DataAnalystAgent:
             code=last_executed_code,
             output=clip_text(last_output, 4000),
             attempts=attempts,
+            partial=False,
+            partial_note="",
         )
 
 

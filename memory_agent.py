@@ -112,7 +112,12 @@ def _history_block(prior_turns) -> str:
     lines = []
     for item in list(prior_turns)[-6:]:
         role = "用户" if item.get("role") == "user" else "助手"
-        content = _clean(item.get("content"))
+        try:
+            from agent_types import extract_text as _extract_text
+            raw = _extract_text(item.get("content"))
+        except Exception:
+            raw = item.get("content")
+        content = _clean(raw)
         if len(content) > 200:
             content = content[:200] + "…"
         if content:
