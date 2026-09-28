@@ -431,6 +431,58 @@ class StringDispatchTests(unittest.TestCase):
             self.assertEqual(safe_pandas.validate_code(code), "", code)
 
 
+class StringDataTests(unittest.TestCase):
+    """字符串常量按上下文校验：派发位置才按属性黑名单，普通位置一律当数据放行。"""
+
+    ALLOWED = [
+        "print(df.rename(columns={'_qty': '数量'}))",
+        "print(df.groupby('部门').agg(_qty=('数量','sum')).to_dict())",
+        "result = df.groupby('部门').agg(_qty=('数量','sum'))\n"
+        "print(result.rename(columns={'_qty':'数量'}).to_dict())",
+        "print(df['_qty'] if '_qty' in df.columns else '无')",
+        "print('_qty', '_备注')",
+        "print(df.groupby('_secret_col')['数量'].sum().to_dict())",
+    ]
+
+    REJECTED = [
+        "print(df.agg('to_json'))",
+        "print(df.apply('eval'))",
+        "print(df['数量'].transform('to_csv'))",
+        "print(df.groupby('部门').agg(y=('数量','to_json')))",
+        "print(df.agg({'数量':'to_json'}))",
+        "print(df.pipe('__class__'))",
+        "print('__class__')",
+        "print(df.agg('_mgr'))",
+        "print('_qty', 'to_json')",
+        "print(df.agg('_constructor'))",
+        "x = '_values'\nprint(x)",
+        "print(df.agg('_data'))",
+        # 间接引用（无法靠常量位置识别，统一按字符串内容校验）
+        "f = 'to_json'\nprint(df.agg(f))",
+        "d = {'a': 'to_json'}\nprint(df.agg(d))",
+        "fs = ['sum', '_mgr']\nprint(df.agg(fs[1]))",
+        "for f in ['to_json']:\n    print(df.agg(f))",
+        "g = (f := 'eval')\nprint(df.apply(f))",
+        "l = []\nl.append('_mgr')\nprint(df.agg(l[0]))",
+    ]
+
+    def test_data_strings_allowed(self):
+        for code in self.ALLOWED:
+            self.assertEqual(safe_pandas.validate_code(code), "", code)
+
+    def test_dispatch_strings_still_rejected(self):
+        for code in self.REJECTED:
+            self.assertTrue(safe_pandas.validate_code(code), code)
+
+    def test_named_agg_underscore_output_runs(self):
+        rows = [["A", "3"], ["B", "5"], ["A", "2"]]
+        columns = ["部门", "数量"]
+        code = "g = df.groupby('部门').agg(_qty=('数量','sum'))\nprint(g['_qty'].to_dict())"
+        result = safe_pandas.run_restricted(code, rows, columns, timeout=60)
+        self.assertEqual(result["error"], "", result)
+        self.assertEqual(result["code_output"].strip(), "{'A': 5, 'B': 5}")
+
+
 class PositiveRunTests(unittest.TestCase):
     """中文列名 + 常用聚合，必须在真子进程里跑出正确结果。"""
 
@@ -649,6 +701,19 @@ class SourceHygieneTests(unittest.TestCase):
         with open(other, "rb") as fh:
             right = fh.read()
         self.assertEqual(left, right)
+
+
+
+class InstanceAttrStringTests(unittest.TestCase):
+    """实例属性（不在类 dir() 里）当字符串用也要拒绝，例如 df.agg('_grouper')。"""
+
+    def test_instance_only_underscore_attrs_rejected(self):
+        for name in ("_attrs", "_flags", "_grouper", "_mgr"):
+            code = f"print(df.agg('{name}'))"
+            self.assertTrue(safe_pandas.validate_code(code), code)
+
+    def test_plain_underscore_data_still_allowed(self):
+        self.assertEqual(safe_pandas.validate_code("print(df.rename(columns={'_qty': '数量'}))"), "")
 
 
 if __name__ == "__main__":
