@@ -6,6 +6,7 @@ import io
 import os
 import re
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -178,21 +179,15 @@ class RunRestrictedTests(unittest.TestCase):
         self.assertLessEqual(len(result["code_output"]), safe_pandas.MAX_OUTPUT_CHARS + 1)
 
 
-def _run_child_without_validator(code, rows=ROWS, columns=COLUMNS):
-    """绕过 AST 校验直接跑子进程，单独验证运行时审计钩子这道防线。"""
-    import json
-    import subprocess
-    boot = safe_pandas._bootstrap_source().replace(
-        "safe_pandas._child_main()",
-        "safe_pandas.validate_code = lambda c: ''\nsafe_pandas._child_main()",
+def _run_child_without_validator(code, rows=ROWS, columns=COLUMNS, timeout=60):
+    """绕过 AST 校验直接跑子进程，单独验证运行时审计钩子这道防线。
+
+    走 safe_pandas 的测试专用入口 _run_child_for_test；生产的 run_restricted
+    永远不会跳过校验（见 PublicApiNeverSkipsValidationTests）。
+    """
+    return safe_pandas._run_child_for_test(
+        code, rows, columns, timeout=timeout, skip_validation=True
     )
-    proc = subprocess.run(
-        [sys.executable, "-I", "-c", boot],
-        input=json.dumps({"code": code, "rows": rows, "columns": columns}),
-        capture_output=True, text=True, env=safe_pandas._child_env(),
-        cwd="/tmp", timeout=60,
-    )
-    return json.loads(proc.stdout or "{}")
 
 
 class ModuleGatewayEscapeTests(unittest.TestCase):
@@ -273,6 +268,344 @@ class ModuleGatewayEscapeTests(unittest.TestCase):
         result = safe_pandas.run_restricted(code, rows, cols, timeout=60)
         self.assertEqual(result["error"], "")
         self.assertTrue(result["code_output"].strip().endswith("完成"))
+
+
+class ModuleAllowlistTests(unittest.TestCase):
+    """pd / np / math 只能以 `模块.白名单属性` 的形式出现。"""
+
+    ESCAPES = [
+        # numpy 的磁盘读取入口：跟服务进程同一个 Unix 用户，能读 token / .env
+        "print(np.genfromtxt('/etc/passwd', dtype=str))",
+        "print(np.loadtxt('/etc/passwd'))",
+        "print(np.fromfile('/etc/passwd'))",
+        "print(np.fromregex('/etc/passwd', '(a)', dtype=str))",
+        "print(np.memmap('/etc/passwd'))",
+        "print(np.DataSource('/etc/passwd'))",
+        "print(np.lib.recfunctions)",
+        "print(np.f2py.os.listdir('/'))",
+        "print(np.ctypeslib.ctypes.CDLL(None))",
+        "print(np.random.default_rng())",
+        "print(np.ma.extras.ma.builtins)",
+        "print(np.testing.tmpdir)",
+        # ctypes / 序列化桥
+        "print(df.values.ctypes)",
+        "print(df.values.tofile('/tmp/x.bin'))",
+        "print(df.values.dump('/tmp/x.pkl'))",
+        "print(pd.DataFrame.to_pickle(df, '/tmp/x.pkl'))",
+        # 帧对象自省 -> 真正的 builtins -> eval/exec/__import__
+        "g = df.iterrows()\nprint(g.gi_frame.f_globals['__builtins__'])",
+        "g = df.iterrows()\nprint(g.gi_frame.f_builtins['__import__']('os'))",
+        "c = df.iterrows()\nprint(c.cr_frame)",
+        # 字符串派发
+        "print(df.agg('to_json'))",
+        "print(df.apply('eval', axis=1))",
+        "print(df.groupby('品名')['金额'].agg('to_pickle'))",
+        # 别名 / 裸模块 / 重新绑定
+        "x = np\nprint(x.genfromtxt('/etc/passwd'))",
+        "print(np)",
+        "print(pd)",
+        "print(math)",
+        "print([np][0].genfromtxt('/etc/passwd'))",
+        "print(np if df is not None else pd)",
+        "f = pd\nprint(f.to_datetime('2024-01-01'))",
+        "pd = 1\nprint(pd)",
+        "np, math = 1, 2\nprint(np)",
+        "for np in [1]:\n    print(np)",
+        "f = lambda np: np\nprint(f(1))",
+        "(np := 1)\nprint(np)",
+    ]
+
+    def test_escapes_rejected(self):
+        for code in self.ESCAPES:
+            reason = safe_pandas.validate_code(code)
+            self.assertTrue(reason, f"应该拒绝: {code!r}")
+
+    def test_reason_names_the_offending_attribute(self):
+        cases = {
+            "print(np.genfromtxt('/etc/passwd'))": "np.genfromtxt",
+            "print(np.loadtxt('/etc/passwd'))": "np.loadtxt",
+            "print(np.memmap('/etc/passwd'))": "np.memmap",
+            "print(np.DataSource('/etc/passwd'))": "np.DataSource",
+            "print(np.lib)": "np.lib",
+            "print(np.f2py)": "np.f2py",
+            "print(np.ctypeslib)": "np.ctypeslib",
+            "print(pd.read_csv('/x'))": "pd.read_csv",
+            "print(pd.io)": "pd.io",
+            "print(np)": "禁止直接使用模块 np",
+        }
+        for code, fragment in cases.items():
+            self.assertIn(fragment, safe_pandas.validate_code(code), code)
+
+    def test_no_numpy_submodule_is_allowed(self):
+        for name in ("random", "lib", "linalg", "char", "ma", "testing", "ctypeslib",
+                     "f2py", "distutils", "polynomial", "fft", "strings", "rec",
+                     "compat", "core", "os", "sys", "version"):
+            code = f"print(np.{name})"
+            self.assertTrue(safe_pandas.validate_code(code), code)
+
+    def test_every_allowlisted_attribute_passes_validation(self):
+        for module, allowed in safe_pandas.MODULE_ALLOWED_ATTRS.items():
+            for attr in sorted(allowed):
+                code = f"print({module}.{attr})"
+                self.assertEqual(safe_pandas.validate_code(code), "", code)
+
+    def test_module_allowlists_have_no_dunder_or_submodule(self):
+        for module, allowed in safe_pandas.MODULE_ALLOWED_ATTRS.items():
+            for attr in allowed:
+                self.assertFalse(attr.startswith("_"), f"{module}.{attr}")
+                self.assertNotIn(".", attr, f"{module}.{attr}")
+
+    def test_math_public_only(self):
+        self.assertEqual(safe_pandas.validate_code("print(math.floor(1.5))"), "")
+        self.assertEqual(safe_pandas.validate_code("print(math.pi, math.e)"), "")
+        self.assertTrue(safe_pandas.validate_code("print(math.__dict__)"))
+        self.assertTrue(safe_pandas.validate_code("print(math.frexp.__globals__)"))
+
+
+class AttributeBlocklistTests(unittest.TestCase):
+    def test_introspection_prefixes_blocked(self):
+        for attr in ("gi_frame", "gi_code", "cr_frame", "cr_code", "ag_frame",
+                     "f_globals", "f_builtins", "f_back", "co_code", "co_consts",
+                     "tb_frame", "tb_next", "im_func", "im_self", "func_code",
+                     "func_globals", "__class__", "__bases__", "__subclasses__",
+                     "__globals__", "__builtins__", "__import__", "__reduce__",
+                     "__getattribute__", "__init_subclass__"):
+            code = f"print(df.{attr})"
+            self.assertTrue(safe_pandas.validate_code(code), code)
+            self.assertTrue(safe_pandas._attribute_blocked(attr), attr)
+
+    def test_disk_and_serialization_attrs_blocked(self):
+        for attr in ("tofile", "fromfile", "dump", "dumps", "load", "loads", "save",
+                     "savetxt", "savez", "savez_compressed", "loadtxt", "genfromtxt",
+                     "fromregex", "memmap", "open_memmap", "DataSource", "ctypes",
+                     "ctypeslib", "lib", "f2py", "distutils", "os", "sys", "builtins",
+                     "globals", "locals", "vars", "getattr", "setattr", "delattr",
+                     "eval", "exec", "compile", "query", "pipe", "style", "plot",
+                     "system", "popen", "format", "format_map", "mro", "subclasses",
+                     "bases", "io", "api", "options", "set_option", "compat", "core",
+                     "testing", "util", "read_csv", "read_excel", "to_csv", "to_json",
+                     "to_pickle", "to_excel", "to_sql"):
+            self.assertTrue(safe_pandas._attribute_blocked(attr), attr)
+            self.assertTrue(safe_pandas.validate_code(f"print(df.{attr})"), attr)
+
+    def test_normal_attributes_still_allowed(self):
+        for attr in ("base", "values", "index", "columns", "shape", "dtypes", "size",
+                     "empty", "iloc", "loc", "str", "dt", "cat", "sum", "mean",
+                     "to_string", "to_dict", "tolist", "to_numpy", "to_frame",
+                     "to_datetime", "to_numeric", "to_timedelta", "groupby"):
+            self.assertFalse(safe_pandas._attribute_blocked(attr), attr)
+        self.assertEqual(safe_pandas.validate_code("print(df.values.base)"), "")
+        self.assertEqual(safe_pandas.validate_code("print(df.shape, df.size, df.empty)"), "")
+
+
+class StringDispatchTests(unittest.TestCase):
+    def test_blocked_strings_rejected(self):
+        for value in ("to_json", "to_pickle", "to_csv", "eval", "query", "pipe",
+                      "tofile", "gi_frame", "f_globals", "read_csv", "system",
+                      "popen", "open", "getattr", "compile", "exec", "globals",
+                      "__class__", "__builtins__", "__import__", "os"):
+            for code in (f"print(df.agg({value!r}))",
+                         f"print(df.apply({value!r}, axis=1))",
+                         f"print(df.groupby('品名')['金额'].agg({value!r}))"):
+                self.assertTrue(safe_pandas.validate_code(code), code)
+
+    def test_normal_and_chinese_strings_still_ok(self):
+        for value in ("sum", "mean", "count", "min", "max", "std", "median",
+                      "first", "last", "nunique", "size", "品名", "金额", "部门",
+                      "数量", "2024-01-01", "%Y-%m", "ME", "all", "coerce",
+                      "升序", "合计: {}"):
+            code = f"print(df.agg({value!r}))"
+            self.assertEqual(safe_pandas.validate_code(code), "", code)
+
+    def test_chinese_column_workflows_accepted(self):
+        for code in (
+            "print(df['金额'].sum())",
+            "print(df.groupby('部门')['金额'].sum().to_dict())",
+            "print(df.sort_values('数量', ascending=False)['品名'].tolist())",
+            "print(df.rename(columns={'品名': '名称'}).to_string())",
+            "print(f\"合计：{df['金额'].sum():.2f} 元\")",
+            "print(df[df['数量'] > 3]['品名'].tolist())",
+            "print(df['品名'].str.len().sum())",
+            "print(df.pivot_table(index='部门', values='金额', aggfunc='sum').to_string())",
+        ):
+            self.assertEqual(safe_pandas.validate_code(code), "", code)
+
+
+class PositiveRunTests(unittest.TestCase):
+    """中文列名 + 常用聚合，必须在真子进程里跑出正确结果。"""
+
+    def run_ok(self, code, rows=ROWS, columns=COLUMNS, timeout=60):
+        result = safe_pandas.run_restricted(code, rows, columns, timeout=timeout)
+        self.assertEqual(result["error"], "", f"{code!r} -> {result}")
+        return result["code_output"]
+
+    def test_chinese_columns_aggregations(self):
+        self.assertEqual(self.run_ok("print(df['数量'].sum())").strip(), "10.0")
+        self.assertEqual(
+            self.run_ok("print(df.groupby('品名')['数量'].sum().to_dict())").strip(),
+            "{'苹果': 10.0, '香蕉': 0.0}",
+        )
+        self.assertEqual(
+            self.run_ok("print(df.sort_values('数量', ascending=False)['品名'].tolist())").strip(),
+            "['苹果', '苹果', '香蕉']",
+        )
+        self.assertEqual(self.run_ok("print(df['金额'].max())").strip(), "10.5")
+        self.assertEqual(self.run_ok("print(round(df['金额'].mean(), 2))").strip(), "4.67")
+        out = self.run_ok("print(df.describe().to_string())")
+        self.assertIn("count", out)
+        self.assertIn("金额", out)
+
+    def test_module_allowlist_functions_work(self):
+        self.assertEqual(self.run_ok("print(np.nan, pd.NA)").strip(), "nan <NA>")
+        self.assertEqual(
+            self.run_ok("print(pd.to_numeric(df['数量'], errors='coerce').sum())").strip(),
+            "10.0",
+        )
+        self.assertEqual(self.run_ok("print(math.floor(df['金额'].max()))").strip(), "10")
+        self.assertEqual(
+            self.run_ok("print(round(math.sqrt(df['金额'].max()), 2))").strip(), "3.24"
+        )
+        self.assertEqual(self.run_ok("print(np.nansum(df['数量']))").strip(), "10.0")
+        self.assertEqual(
+            self.run_ok("print(pd.to_datetime('2024-01-02').year)").strip(), "2024"
+        )
+        self.assertEqual(
+            self.run_ok("print(pd.Series(df['金额']).round(1).tolist())").strip(),
+            "[10.5, 2.0, 1.5]",
+        )
+
+    def test_groupby_agg_with_string_list_still_works(self):
+        out = self.run_ok("print(df.groupby('品名')['金额'].agg(['sum', 'mean']).to_dict())")
+        self.assertIn("苹果", out)
+        self.assertIn("mean", out)
+
+
+class AuditHookDefenseTests(unittest.TestCase):
+    """绕过 AST 校验，验证子进程里的审计钩子确实兜得住。"""
+
+    SECRET = "SECRET-TOKEN-VALUE"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sandbox-test-")
+        self.secret_path = os.path.join(self.tmp, "token.txt")
+        with open(self.secret_path, "w", encoding="utf-8") as fh:
+            fh.write(self.SECRET)
+        self.builtins_line = "bi = np.ma.extras.ma.builtins\n"
+
+    def tearDown(self):
+        for name in os.listdir(self.tmp):
+            os.remove(os.path.join(self.tmp, name))
+        os.rmdir(self.tmp)
+
+    def assert_blocked(self, code, fragment="沙箱禁止"):
+        result = _run_child_without_validator(code)
+        self.assertTrue(result.get("error"), f"应该被拦截: {code!r} -> {result}")
+        if fragment:
+            # fragment=None：钩子确实抛了 PermissionError，但 numpy 的 C 代码把
+            # 异常吞掉后报 SystemError（例如 np.fromfile / ndarray.tofile）。
+            self.assertIn(fragment, result["error"], code)
+        combined = result["error"] + result.get("code_output", "")
+        self.assertNotIn(self.SECRET, combined, code)
+        self.assertNotIn("root:", combined, code)
+        return result
+
+    def test_open_secret_file_blocked(self):
+        self.assert_blocked(self.builtins_line + f"print(bi.open({self.secret_path!r}).read())")
+        self.assert_blocked(f"print(pd.read_csv({self.secret_path!r}))")
+        self.assert_blocked(f"print(np.genfromtxt({self.secret_path!r}, dtype=str))")
+        self.assert_blocked(f"print(np.loadtxt({self.secret_path!r}, dtype=str))")
+        self.assert_blocked(f"print(np.fromfile({self.secret_path!r}, dtype='S1'))", None)
+        self.assert_blocked(self.builtins_line + "print(bi.open('/etc/passwd').read())")
+        self.assert_blocked(self.builtins_line + "print(bi.open('/proc/self/environ').read())")
+
+    def test_write_blocked(self):
+        target = os.path.join(self.tmp, "escape.txt")
+        self.assert_blocked(self.builtins_line + f"print(bi.open({target!r}, 'w'))")
+        self.assert_blocked(f"print(df.values.tofile({target!r}))", None)
+        self.assert_blocked(f"print(df.values.dump({target!r}))", None)
+        self.assertFalse(os.path.exists(target))
+
+    def test_socket_blocked(self):
+        self.assert_blocked("import socket\nprint(socket.socket())", "沙箱禁止导入模块：socket")
+        self.assert_blocked(self.builtins_line + "print(bi.__import__('socket').socket())")
+
+    def test_os_and_subprocess_blocked(self):
+        self.assert_blocked(self.builtins_line + "print(bi.__import__('os').listdir('/'))")
+        self.assert_blocked(self.builtins_line + "print(bi.__import__('os').system('id'))")
+        self.assert_blocked(
+            self.builtins_line + "print(bi.__import__('subprocess').check_output(['id']))"
+        )
+        self.assert_blocked(self.builtins_line + "print(bi.__import__('ctypes').CDLL(None))")
+
+    def test_second_exec_and_compile_blocked(self):
+        self.assert_blocked(self.builtins_line + "print(bi.exec('print(1)'))")
+        self.assert_blocked(self.builtins_line + "print(bi.eval('1+1'))")
+        self.assert_blocked(
+            self.builtins_line + "print(bi.compile('print(1)', '<string>', 'exec'))"
+        )
+
+    def test_module_mutation_rejected_by_validator(self):
+        for code in (
+            "print(object.__setattr__(pd, 'NA', 1))",
+            "setattr(pd, 'NA', 1)\nprint(pd.NA)",
+            "print(pd.__dict__)",
+            "print(np.__dict__)",
+            "print(df.__class__.__bases__)",
+        ):
+            self.assertTrue(safe_pandas.validate_code(code), code)
+
+    def test_normal_pandas_work_still_succeeds_with_hook_armed(self):
+        rows = [["苹果", "3", "10.5", "2024-01-02"], ["香蕉", "", "2", "2024-02-03"],
+                ["苹果", "7", "1.5", "2024-03-04"]]
+        cols = ["品名", "数量", "金额", "日期"]
+        code = "\n".join([
+            "print(df.dtypes.to_dict()['金额'])",
+            "print(df.groupby('品名')['数量'].sum().to_dict())",
+            "print(df.sort_values('金额', ascending=False)['品名'].tolist())",
+            "print(round(df['金额'].mean(), 2))",
+            "d = df.copy()",
+            "d['日期'] = pd.to_datetime(d['日期'])",
+            "print(d['日期'].dt.strftime('%Y-%m').tolist())",
+            "print(np.nansum(df['数量']))",
+            "print(math.floor(df['金额'].max()))",
+            "print(df.describe().shape)",
+            "print('完成')",
+        ])
+        result = safe_pandas.run_restricted(code, rows, cols, timeout=60)
+        self.assertEqual(result["error"], "")
+        lines = result["code_output"].strip().splitlines()
+        self.assertEqual(lines[-1], "完成")
+        self.assertEqual(lines[1], "{'苹果': 10.0, '香蕉': 0.0}")
+        self.assertEqual(lines[3], "4.67")
+
+
+class PublicApiNeverSkipsValidationTests(unittest.TestCase):
+    def test_run_restricted_source_has_no_skip_flag(self):
+        import inspect
+        source = inspect.getsource(safe_pandas.run_restricted)
+        self.assertNotIn("skip_validation", source)
+        self.assertNotIn("_run_child_for_test", source)
+
+    def test_child_revalidates_even_if_parent_validator_patched(self):
+        original = safe_pandas.validate_code
+        safe_pandas.validate_code = lambda code: ""
+        try:
+            result = safe_pandas.run_restricted(
+                "print(open('/etc/passwd').read())", ROWS, COLUMNS
+            )
+        finally:
+            safe_pandas.validate_code = original
+        self.assertTrue(result["error"])
+        self.assertEqual(result["code_output"], "")
+        self.assertIn("open", result["error"])
+
+    def test_test_helper_is_private_and_opt_in(self):
+        self.assertTrue(hasattr(safe_pandas, "_run_child_for_test"))
+        # 默认不跳过校验：即使走测试入口，危险代码也会被拒绝
+        result = safe_pandas._run_child_for_test(
+            "print(open('/etc/passwd').read())", ROWS, COLUMNS, timeout=30
+        )
+        self.assertIn("open", result["error"])
 
 
 def _mcp_copy(name):

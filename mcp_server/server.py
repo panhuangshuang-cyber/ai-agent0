@@ -21,6 +21,7 @@ https://py.sdk.modelcontextprotocol.io/v2/migration/#fastmcp-renamed-to-mcpserve
 """
 import logging
 import os
+import re
 import time
 
 from mcp.server.mcpserver import MCPServer
@@ -174,6 +175,35 @@ def _as_int(value):
         return None
 
 
+def _first_positive(sheet: dict, keys) -> int | None:
+    """concise 模式下 rowCount/columnCount 可能为 0，真实网格大小在 rowTotal/columnTotal。"""
+    for key in keys:
+        value = _as_int(sheet.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+_TIME_CELL_RE = re.compile(
+    r"^\{'time': \{'year': (\d+), 'month': (\d+), 'day': (\d+), "
+    r"'hour': (\d+), 'minute': (\d+), 'second': (\d+)\}\}$"
+)
+
+
+def _normalize_cell(value):
+    """client 把日期单元格转成了 "{'time': {...}}" 字符串，这里还原成 YYYY-MM-DD[ HH:MM:SS]。"""
+    if not isinstance(value, str) or not value.startswith("{'time'"):
+        return value
+    m = _TIME_CELL_RE.match(value)
+    if not m:
+        return value
+    y, mo, d, h, mi, sec = (int(x) for x in m.groups())
+    text = f"{y:04d}-{mo:02d}-{d:02d}"
+    if h or mi or sec:
+        text += f" {h:02d}:{mi:02d}:{sec:02d}"
+    return text
+
+
 def _sheet_id_of(sheet: dict) -> str:
     return str(sheet.get("sheetId") or sheet.get("id") or "")
 
@@ -202,7 +232,8 @@ def _pick_doc(c, doc_title: str) -> tuple[str, str, dict | None]:
             "candidates": [str(d.get("title") or "") for d in matches],
         }
     doc = matches[0]
-    return str(doc.get("id") or ""), str(doc.get("title") or doc_title), {}
+    # 腾讯 drive/v2/filter 实际返回大写 "ID"
+    return str(doc.get("id") or doc.get("ID") or ""), str(doc.get("title") or doc_title), {}
 
 
 def _pick_sheet(c, file_id: str, real_title: str, sheet_name: str, sheet_id: str) -> tuple[dict | None, dict | None]:
@@ -254,11 +285,19 @@ def _read_rows_paginated(c, file_id: str, sheet_id: str, rows_to_read: int, cols
         chunk = (c.read_sheet_range(file_id, sheet_id, cell_range) or {}).get("values") or []
         if not chunk:
             break
-        values.extend(chunk)
+        rows = [[_normalize_cell(cell) for cell in row] for row in chunk]
+        values.extend(rows)
+        if not any(str(cell).strip() for row in rows for cell in row):
+            # 整批都是空白行：腾讯表格的 rowCount 常常远大于真实数据行，
+            # 继续翻页只会浪费配额，直接停。
+            break
         if len(chunk) < batch:
             # 返回行数不足，说明已到表格末尾
             break
         start += batch
+    # 网格大小（rowTotal）包含末尾空白行，去掉末尾整行为空的数据
+    while values and not any(str(cell).strip() for cell in values[-1]):
+        values.pop()
     return values
 
 
@@ -282,8 +321,8 @@ def _search_and_read_sheet_impl(
 
     resolved_sheet_id = _sheet_id_of(sheet)
     sheet_title = str(sheet.get("title") or "")
-    total_rows = _as_int(sheet.get("rowCount"))
-    column_count = _as_int(sheet.get("columnCount", sheet.get("colCount")))
+    total_rows = _first_positive(sheet, ("rowCount", "rowTotal"))
+    column_count = _first_positive(sheet, ("columnCount", "colCount", "columnTotal"))
 
     cols = _as_int(max_cols) or 30
     cols = max(1, min(cols, SHEET_MAX_COLS_PER_REQUEST))
@@ -304,6 +343,10 @@ def _search_and_read_sheet_impl(
     rows_read = len(values)
     end_col = get_col_name(cols - 1)
     truncated = rows_read >= rows_to_read and (total_rows is None or total_rows > rows_read)
+    if not truncated and rows_read:
+        # 已读到数据末尾：rowTotal 是网格大小（含末尾空白行），以实际数据行数为准，
+        # 避免 web 端把 “rows_read < total_rows” 误判为只读了部分数据。
+        total_rows = rows_read
     result = {
         "doc_title": real_title,
         "sheet_title": sheet_title,
@@ -380,7 +423,10 @@ def analyze_sheet_pandas(
     它会自动定位表格（可传 file_id + sheet_id 精确定位）并转为 pandas DataFrame，变量名为 df。
     请在 python_code 中编写纯 Python 逻辑（不用写 markdown，只写代码；不要 import、不要访问
     下划线开头的属性），并务必使用 print() 输出结果。代码在受限沙箱子进程里执行，
-    只允许使用 df / pd / np / math 和常用内置函数。
+    只允许使用 df / pd / np / math 和常用内置函数；pd/np/math 只能写成 `pd.属性`、
+    `np.属性` 形式，属性必须在白名单内（不能用任何子模块，例如 np.random、pd.io），
+    也不能把模块赋值给别的名字；禁止文件读写、网络、eval/exec/query/pipe，
+    以及 df.agg('to_json') 这类字符串派发。
     示例:
     print(df.head())
     print("总计:", df["总价"].sum())

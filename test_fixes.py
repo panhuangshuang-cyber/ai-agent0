@@ -726,3 +726,25 @@ class IdsPassingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(read_calls), 1)
         # 5 列 -> E，不再硬编码 AD
         self.assertEqual(read_calls[0]["cell_range"], "A1:E21")
+
+
+class RealTencentPayloadShapeTests(unittest.TestCase):
+    """线上实测发现的真实返回格式：list_docs 用大写 ID，list_sheets 在 result 里、
+    concise 模式 rowCount/columnCount 为 0，真实网格大小在 rowTotal/columnTotal。"""
+
+    def test_extract_docs_accepts_uppercase_id(self):
+        from doc_locator_agent import _extract_docs
+        payload = {"next": 0, "list": [
+            {"ID": "300000000$abc", "title": "板材库存", "type": "sheet"},
+            {"ID": "300000000$def", "title": "tx", "type": "sheet"},
+        ]}
+        docs = _extract_docs(payload)
+        self.assertEqual([d["title"] for d in docs], ["板材库存", "tx"])
+        self.assertEqual(docs[0]["id"], "300000000$abc")
+
+    def test_extract_sheets_uses_row_total_when_row_count_zero(self):
+        from doc_locator_agent import _extract_sheets
+        payload = {"result": [{"sheetId": "BB08J2", "title": "工作表1", "rowCount": 0,
+                               "columnCount": 0, "rowTotal": 197, "columnTotal": 26}]}
+        sheets = _extract_sheets(payload)
+        self.assertEqual(sheets, [{"title": "工作表1", "id": "BB08J2", "row_count": 197, "column_count": 26}])
