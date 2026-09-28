@@ -430,6 +430,38 @@ class PartialReadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("可能不完整", text)
         self.assertIn("只读取了前", text)
 
+    async def test_full_analysis_ignores_locator_preview_truncation(self):
+        """线上实测：统计已覆盖全表，却因定位阶段只读了 4 行预览而提示“只读取了前 4 行”。"""
+        seen = {}
+
+        async def chat(messages, tools, tool_choice):
+            seen["material"] = json.loads(messages[-1]["content"])
+            return _Response(_Message(content="数量总计 83"))
+        text = await AnswerAgent(chat=chat).run(
+            "数量一共多少",
+            SchedulePlan(intent="analyze", question="合计", calc_goal="求和"),
+            LocatedResult(status="found", doc_title="板材库存", sheet_title="工作表1", truncated=True,
+                          note="只读取了前 4 行（共 197 行），统计结果可能不完整。"),
+            AnalysisResult(status="ok", doc_title="板材库存", sheet_title="工作表1", output="83",
+                           partial=False, partial_note=""),
+        )
+        self.assertEqual(text, "数量总计 83")
+        self.assertFalse(seen["material"]["truncated"])
+        self.assertEqual(seen["material"]["partial_notes"], [])
+        self.assertEqual(seen["material"]["note"], "")
+
+    async def test_failed_analysis_keeps_locator_note(self):
+        async def chat(messages, tools, tool_choice):
+            return _Response(_Message(content="没有算出来"))
+        text = await AnswerAgent(chat=chat).run(
+            "数量一共多少",
+            SchedulePlan(intent="analyze", question="合计", calc_goal="求和"),
+            LocatedResult(status="found", doc_title="表", sheet_title="明细", truncated=True,
+                          note="只读取了前 4 行（共 197 行），统计结果可能不完整。"),
+            AnalysisResult(status="error", doc_title="表", sheet_title="明细"),
+        )
+        self.assertIn("只读取了前 4 行", text)
+
 
 class AnalystErrorTests(unittest.IsolatedAsyncioTestCase):
     async def test_null_error_is_success(self):

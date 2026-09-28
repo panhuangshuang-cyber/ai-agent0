@@ -322,6 +322,8 @@ def _search_and_read_sheet_impl(
     resolved_sheet_id = _sheet_id_of(sheet)
     sheet_title = str(sheet.get("title") or "")
     total_rows = _first_positive(sheet, ("rowCount", "rowTotal"))
+    # rowCount 为 0 时 rowTotal 只是网格大小（常含大量空白行），不是真实数据行数
+    total_is_grid = not _first_positive(sheet, ("rowCount",)) and total_rows is not None
     column_count = _first_positive(sheet, ("columnCount", "colCount", "columnTotal"))
 
     cols = _as_int(max_cols) or 30
@@ -360,7 +362,9 @@ def _search_and_read_sheet_impl(
         "truncated": truncated,
     }
     if truncated:
-        if total_rows:
+        if total_rows and total_is_grid:
+            result["note"] = f"只读取了前 {rows_read} 行（表格网格共 {total_rows} 行，可能含空白行），统计结果可能不完整。"
+        elif total_rows:
             result["note"] = f"只读取了前 {rows_read} 行（共 {total_rows} 行），统计结果可能不完整。"
         else:
             result["note"] = f"只读取了前 {rows_read} 行，统计结果可能不完整。"

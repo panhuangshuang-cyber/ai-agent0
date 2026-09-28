@@ -389,6 +389,20 @@ class RealPayloadShapeTests(unittest.TestCase):
         self.assertEqual(result["data"][1][0], "2025-10-03")
         self.assertEqual(result["data"][2][0], "2025-10-04 09:30:00")
 
+    def test_grid_total_note_when_row_count_zero(self):
+        grid = [["金额"]] + [[str(i)] for i in range(1, 60)]
+        fake = FakeClient(
+            docs={"list": [{"ID": "f1", "title": "板材库存"}]},
+            sheets=[{"sheetId": "s1", "title": "工作表1", "rowCount": 0, "columnCount": 0,
+                     "rowTotal": 200, "columnTotal": 1}],
+            grid={("f1", "s1"): grid},
+        )
+        with _patched(fake):
+            result = server._search_and_read_sheet_impl("板材库存", max_rows=10)
+        self.assertTrue(result["truncated"])
+        self.assertIn("网格", result["note"])
+        self.assertIn("只读取了前 10 行", result["note"])
+
     def test_analyze_with_real_shapes(self):
         grid = [["入库日期", "品名", "数量", ""],
                 ["{'time': {'year': 2025, 'month': 10, 'day': 3, 'hour': 0, 'minute': 0, 'second': 0}}", "A", "1", ""],
