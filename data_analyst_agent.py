@@ -14,6 +14,7 @@ from agent_types import (
     LocatedResult,
     SchedulePlan,
     assistant_tool_message,
+    clean_text,
     clip_text,
     first_message,
     function_tool,
@@ -76,12 +77,20 @@ ANALYZE_TOOL = function_tool(
 
 SYSTEM_PROMPT = """你是数据分析代理。只为给定文档和子表编写 pandas 计算代码。
 变量 df、pd、np、math 已经存在，不要 import。代码必须 print 最终结果。
+按某一列（例如日期）分组统计时，必须同时 print 出缺失或无法解析的行数以及这部分对应的度量值合计
+（例如用 pd.to_datetime(..., errors='coerce') 后单独统计 NaT 的那部分），这样才能解释分组合计与总计不一致的原因。
 沙箱限制：pd / np / math 只能写成 pd.属性、np.属性 的形式，且属性必须在白名单里
 （不能用任何子模块，例如 np.random、pd.io），也不能把模块赋值给别的名字；
 禁止文件读写、网络、eval / exec / query / pipe、下划线开头的属性，
 以及 df.agg('to_json') 这类字符串派发；列名等普通中文字符串可以正常使用。
 必须调用 analyze_sheet_pandas；不要搜索文档，不要修改表格，不要根据样例行心算答案。
 收到拒绝或执行错误后，改写代码再试。"""
+
+
+def _log_attempt_failure(attempt: int, reason: Any) -> None:
+    """把失败原因压成单行短文本记进日志，方便排查线上重试。"""
+    text = clean_text(reason)
+    logging.info("agent=analyst attempt=%s failed reason=%s", attempt, text[:200])
 
 
 class DataAnalystAgent:
@@ -133,12 +142,14 @@ class DataAnalystAgent:
             if not calls:
                 attempts += 1
                 last_output = "数据分析没有调用 analyze_sheet_pandas"
+                _log_attempt_failure(attempts, last_output)
                 messages.append({"role": "assistant", "content": str(getattr(message, "content", "") or "")})
                 messages.append({"role": "user", "content": last_output})
                 continue
             if len(calls) != 1:
                 attempts += 1
                 last_output = "每次只能调用一次 analyze_sheet_pandas"
+                _log_attempt_failure(attempts, last_output)
                 messages.append({"role": "assistant", "content": str(getattr(message, "content", "") or "")})
                 messages.append({"role": "user", "content": last_output})
                 continue
@@ -149,11 +160,13 @@ class DataAnalystAgent:
             attempts += 1
             if name != "analyze_sheet_pandas":
                 last_output = ANALYST_SCOPE_REJECTION
+                _log_attempt_failure(attempts, f"tool={name} {last_output}")
                 messages.append(assistant_tool_message(message))
                 messages.append(tool_result_message(call, name, last_output))
                 continue
             if args is None:
                 last_output = "工具参数不是合法 JSON"
+                _log_attempt_failure(attempts, last_output)
                 messages.append(assistant_tool_message(message))
                 messages.append(tool_result_message(call, name, last_output))
                 continue
@@ -162,6 +175,7 @@ class DataAnalystAgent:
             rejection = validate_analysis_code(proposed_code)
             if rejection:
                 last_output = rejection
+                _log_attempt_failure(attempts, rejection)
                 messages.append(assistant_tool_message(message))
                 messages.append(tool_result_message(call, name, rejection))
                 continue
@@ -194,6 +208,8 @@ class DataAnalystAgent:
             )
             partial, partial_note = _partial_info(payload, located)
             logging.info("agent=analyst tool=%s attempt=%s ok=%s", name, attempts, not has_error)
+            if has_error:
+                _log_attempt_failure(attempts, error_value or last_output or "分析执行失败")
             if not has_error:
                 return AnalysisResult(
                     status="ok",
