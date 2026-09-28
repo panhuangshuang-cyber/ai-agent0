@@ -5,7 +5,7 @@
 
 安全模型：
 - validate_code: 纯 AST 白名单校验（允许节点类型、允许名称、pd/np/math 属性白名单、
-  通用属性黑名单、字符串常量黑名单、必须 print、长度上限），在调用 MCP / 启动子
+  通用属性黑名单、派发位置字符串校验、必须 print、长度上限），在调用 MCP / 启动子
   进程之前给模型反馈。
 - run_restricted: 在独立子进程里执行（sys.executable -I，隔离环境变量与
   当前目录），最小化 env（不继承任何父进程密钥），resource 限制
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import io
 import json
 import logging
@@ -188,13 +189,82 @@ def _module_attr_target_ids(tree: ast.AST) -> set[int]:
     }
 
 
-def _string_constant_reason(value: str) -> str:
-    """字符串常量校验：防 df.agg('to_json') / df.apply('eval') 这类字符串派发绕过。"""
-    if "__" in value:
-        return "代码包含禁止的字符串（含有双下划线）"
-    if value.isidentifier() and _attribute_blocked(value):
-        return f"代码包含禁止的字符串：{value}"
-    return ""
+#: 字符串常量会被 pandas 按 getattr 解析成方法/属性名（df.agg('to_json')、
+#: df.apply('eval') 等）。间接引用（f='to_json'; df.agg(f)）无法靠常量位置
+#: 识别，所以改为对代码里「所有」字符串常量统一校验，不再区分派发位置。
+#: 判定「无害的下划线数据名」时，需要知道哪些名字是真实的 pandas/numpy 属性；
+#: 以下类的 dir() 集合就用来做这个区分。
+_DISPATCH_ATTR_CLASSES = (
+    "pandas.DataFrame",
+    "pandas.Series",
+    "pandas.Index",
+    "pandas.core.groupby.DataFrameGroupBy",
+    "pandas.core.groupby.SeriesGroupBy",
+    "pandas.core.window.Rolling",
+    "pandas.core.window.Expanding",
+    "pandas.core.resample.Resampler",
+    "numpy.ndarray",
+    "numpy.generic",
+)
+
+
+#: dir(cls) 在不同 pandas 版本间并不稳定：一些真实的内部属性（如 DataFrame
+#: 的 _mgr，或旧版的 _data）是实例属性、在新版里已从类的 dir() 消失，但它们
+#: 仍是危险的内部名，绝不能当作「无害数据名」放行。这里显式补充，保证跨版本
+#: 一致地拒绝。
+_DISPATCH_ATTR_EXTRA = frozenset({"_mgr", "_data"})
+
+
+@functools.lru_cache(maxsize=1)
+def _dispatch_attr_names() -> frozenset[str]:
+    """收集上述类的所有属性名（dir()），用于区分「真实 pandas 属性」与
+    「无害的下划线数据名」。惰性导入；某个类导入失败就跳过它，但
+    DataFrame/Series/Index/ndarray 必须始终包含。"""
+    names: set[str] = set(_DISPATCH_ATTR_EXTRA)
+    for dotted in _DISPATCH_ATTR_CLASSES:
+        module_name, _, attr = dotted.rpartition(".")
+        try:
+            module = __import__(module_name, fromlist=[attr])
+            cls = getattr(module, attr)
+        except Exception:
+            continue
+        try:
+            names.update(dir(cls))
+        except Exception:
+            continue
+    # 实例属性（_attrs、_flags、_grouper、_item_cache…）不在类的 dir() 里，
+    # 用样例实例的 vars() 补上。
+    try:
+        import numpy as np
+        import pandas as pd
+
+        frame = pd.DataFrame({"k": ["a", "b"], "v": [1.0, 2.0]})
+        dated = frame.set_index(pd.date_range("2024-01-01", periods=2))
+        samples = [
+            frame, frame["v"], frame.index, frame.groupby("k"), frame.groupby("k")["v"],
+            frame["v"].rolling(1), frame["v"].expanding(), dated.resample("D"),
+            np.arange(2),
+        ]
+        for sample in samples:
+            try:
+                names.update(vars(sample))
+            except TypeError:
+                pass
+            try:
+                names.update(dir(sample))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return frozenset(names)
+
+
+def _is_harmless_underscore_name(value: str) -> bool:
+    """判断是否为「无害的下划线数据名」：以单个下划线开头，且不是任何相关
+    pandas/numpy 类的属性名。"""
+    if not value.startswith("_") or value.startswith("__"):
+        return False
+    return value not in _dispatch_attr_names()
 
 
 def validate_code(code: object) -> str:
@@ -260,9 +330,15 @@ def validate_code(code: object) -> str:
 
     for node in nodes:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            reason = _string_constant_reason(node.value)
-            if reason:
-                return reason
+            value = node.value
+            if "__" in value:
+                return "代码包含禁止的字符串（含有双下划线）"
+            # 对所有字符串常量统一校验：命中属性黑名单就拒绝（含间接引用，
+            # 如 f='to_json'; df.agg(f)）。唯一例外是「无害的下划线数据名」
+            # （单个下划线开头且不是任何 pandas/numpy 类的属性），如 '_qty'。
+            if value.isidentifier() and _attribute_blocked(value):
+                if not _is_harmless_underscore_name(value):
+                    return f"代码包含禁止的字符串：{value}"
     if not has_print:
         return "代码必须包含 print 调用"
     return ""

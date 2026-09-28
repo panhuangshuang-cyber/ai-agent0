@@ -76,7 +76,9 @@ ANALYZE_TOOL = function_tool(
 )
 
 SYSTEM_PROMPT = """你是数据分析代理。只为给定文档和子表编写 pandas 计算代码。
-变量 df、pd、np、math 已经存在，不要 import。代码必须 print 最终结果。
+变量 df、pd、np、math 已经存在。严禁使用 import / from ... import
+（环境已内置 df、pd、np、math，直接用即可，写 import 一定会被拒绝并浪费一次机会）。
+代码必须 print 最终结果。
 按某一列（例如日期）分组统计时，必须同时 print 出缺失或无法解析的行数以及这部分对应的度量值合计
 （例如用 pd.to_datetime(..., errors='coerce') 后单独统计 NaT 的那部分），这样才能解释分组合计与总计不一致的原因。
 沙箱限制：pd / np / math 只能写成 pd.属性、np.属性 的形式，且属性必须在白名单里
