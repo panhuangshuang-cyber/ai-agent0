@@ -63,7 +63,7 @@ def _partial_info(payload: dict[str, Any], located: LocatedResult) -> tuple[bool
 
 ANALYZE_TOOL = function_tool(
     "analyze_sheet_pandas",
-    "Execute restricted pandas code against the already located sheet. Variables df and pd already exist.",
+    "Execute restricted pandas code against the already located sheet. Variables df, pd, np and math already exist; no imports, no file or network access.",
     {
         "doc_title": {"type": "string"},
         "python_code": {"type": "string"},
@@ -75,7 +75,11 @@ ANALYZE_TOOL = function_tool(
 )
 
 SYSTEM_PROMPT = """你是数据分析代理。只为给定文档和子表编写 pandas 计算代码。
-变量 df 和 pd 已经存在，不要 import。代码必须 print 最终结果。
+变量 df、pd、np、math 已经存在，不要 import。代码必须 print 最终结果。
+沙箱限制：pd / np / math 只能写成 pd.属性、np.属性 的形式，且属性必须在白名单里
+（不能用任何子模块，例如 np.random、pd.io），也不能把模块赋值给别的名字；
+禁止文件读写、网络、eval / exec / query / pipe、下划线开头的属性，
+以及 df.agg('to_json') 这类字符串派发；列名等普通中文字符串可以正常使用。
 必须调用 analyze_sheet_pandas；不要搜索文档，不要修改表格，不要根据样例行心算答案。
 收到拒绝或执行错误后，改写代码再试。"""
 

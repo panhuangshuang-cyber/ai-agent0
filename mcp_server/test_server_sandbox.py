@@ -234,6 +234,25 @@ class PaginationTests(unittest.TestCase):
         self.assertNotIn("note", result)
         self.assertEqual(result["rows_read"], 3)
 
+    def test_blank_tail_rows_stop_pagination(self):
+        """rowCount 远大于真实数据行时，整批空白就该停止翻页。"""
+        filled = [["品名", "数量"]] + [[f"p{i}", str(i)] for i in range(1, 30)]
+        rows = filled + [["", ""] for _ in range(5000 - len(filled))]
+        fake = FakeClient(
+            docs={"list": [{"id": "f1", "title": "销售"}]},
+            sheets=[_sheet("s1", "明细", row_count=5000, col_count=2)],
+            grid={("f1", "s1"): rows},
+        )
+        with _patched(fake):
+            result = server._search_and_read_sheet_impl("销售", max_rows=5000, max_cols=2)
+        self.assertNotIn("error", result)
+        self.assertEqual(result["rows_read"], 30)
+        self.assertEqual(result["total_rows"], 30)
+        self.assertFalse(result["truncated"])
+        self.assertNotIn("note", result)
+        self.assertEqual(len(result["data"]), 30)
+        self.assertLessEqual(len(fake.read_calls), 2)
+
     def test_read_failure_is_friendly(self):
         class BoomClient(FakeClient):
             def read_sheet_range(self, file_id, sheet_id, cell_range):
@@ -343,6 +362,50 @@ class AnalyzeToolTests(unittest.TestCase):
         self.assertIn("只读取了前 10000 行（共 12000 行）", result["note"])
         self.assertEqual(result["code_output"], str(sum(range(1, 10000))))
         self.assertEqual(len(fake.read_calls), 10)
+
+
+class RealPayloadShapeTests(unittest.TestCase):
+    """线上实测：大写 ID、rowCount=0 + rowTotal 网格、日期单元格、末尾空白行。"""
+
+    def test_uppercase_id_rowtotal_dates_and_blank_tail(self):
+        grid = [["入库日期", "品名", "数量", ""]]
+        grid.append(["{'time': {'year': 2025, 'month': 10, 'day': 3, 'hour': 0, 'minute': 0, 'second': 0}}", "A", "1", ""])
+        grid.append(["{'time': {'year': 2025, 'month': 10, 'day': 4, 'hour': 9, 'minute': 30, 'second': 0}}", "B", "2", ""])
+        grid.extend([["", "", "", ""] for _ in range(20)])
+        fake = FakeClient(
+            docs={"next": 0, "list": [{"ID": "f1", "title": "板材库存"}, {"ID": "f2", "title": "tx"}]},
+            sheets=[{"sheetId": "s1", "title": "工作表1", "rowCount": 0, "columnCount": 0,
+                     "rowTotal": len(grid), "columnTotal": 4}],
+            grid={("f1", "s1"): grid},
+        )
+        with _patched(fake):
+            result = server._search_and_read_sheet_impl("板材库存", max_rows=200)
+        self.assertNotIn("error", result)
+        self.assertEqual(result["file_id"], "f1")
+        self.assertEqual(result["rows_read"], 3)
+        self.assertEqual(result["total_rows"], 3)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["total_cols"], 4)
+        self.assertEqual(result["data"][1][0], "2025-10-03")
+        self.assertEqual(result["data"][2][0], "2025-10-04 09:30:00")
+
+    def test_analyze_with_real_shapes(self):
+        grid = [["入库日期", "品名", "数量", ""],
+                ["{'time': {'year': 2025, 'month': 10, 'day': 3, 'hour': 0, 'minute': 0, 'second': 0}}", "A", "1", ""],
+                ["{'time': {'year': 2025, 'month': 11, 'day': 4, 'hour': 0, 'minute': 0, 'second': 0}}", "A", "2", ""],
+                ["", "", "", ""]]
+        fake = FakeClient(
+            docs={"list": [{"ID": "f1", "title": "板材库存"}]},
+            sheets=[{"sheetId": "s1", "title": "工作表1", "rowCount": 0, "columnCount": 0,
+                     "rowTotal": 4, "columnTotal": 4}],
+            grid={("f1", "s1"): grid},
+        )
+        code = "print(df['数量'].sum())\nprint(pd.to_datetime(df['入库日期']).dt.month.tolist())"
+        with _patched(fake):
+            result = server.analyze_sheet_pandas("板材库存", code)
+        self.assertNotIn("error", result)
+        self.assertEqual(result["code_output"], "3\n[10, 11]")
+        self.assertFalse(result["truncated"])
 
 
 if __name__ == "__main__":

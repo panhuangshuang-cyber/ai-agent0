@@ -246,16 +246,19 @@ class DocLocatorAgent:
         columns, rows, payload_truncated = normalize_rows(payload, row_limit, 30)
         row_count = sheet.get("row_count")
         data_rows_returned = max(0, len(rows))
-        total_known: int | None = row_count if isinstance(row_count, int) else None
-        if total_known is None:
-            for key in ("total_rows", "totalRows", "row_count", "rowCount"):
-                value = payload.get(key)
-                try:
-                    if value is not None and str(value) != "":
-                        total_known = int(value)
-                        break
-                except (TypeError, ValueError):
-                    continue
+        # 服务端返回的 total_rows 优先（已按实际数据行校正）；子表元数据里的
+        # 行数可能是网格大小（含末尾空白行），只作兜底。
+        total_known: int | None = None
+        for key in ("total_rows", "totalRows", "row_count", "rowCount"):
+            value = payload.get(key)
+            try:
+                if value is not None and str(value) != "":
+                    total_known = int(value)
+                    break
+            except (TypeError, ValueError):
+                continue
+        if total_known is None and isinstance(row_count, int):
+            total_known = row_count
         # 截断判定：
         # - 服务端明确标记（truncated/has_more/note 封顶字样）时永远截断；
         # - 总数已知且“收到数据行 + 表头 == 总数”时视为完整读取，
@@ -331,7 +334,8 @@ def _extract_docs(payload: Any) -> list[dict[str, str]]:
         if not isinstance(item, dict):
             continue
         raw_title = item.get("title") or item.get("name") or item.get("doc_title")
-        raw_id = item.get("id") or item.get("file_id") or item.get("fileId")
+        # 腾讯 drive/v2/filter 实际返回大写 "ID"
+        raw_id = item.get("id") or item.get("ID") or item.get("file_id") or item.get("fileId")
         title = str(raw_title) if raw_title is not None else ""
         file_id = str(raw_id) if raw_id is not None else ""
         if title and file_id:
@@ -351,6 +355,18 @@ def _col_letter(index: int) -> str:
     return letter
 
 
+def _first_positive_int(item: dict, keys: Iterable[str]) -> int | None:
+    for key in keys:
+        value = item.get(key)
+        try:
+            number = int(value) if value is not None and value != "" else None
+        except (TypeError, ValueError):
+            number = None
+        if number is not None and number > 0:
+            return number
+    return None
+
+
 def _extract_sheets(payload: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for item in _unwrap_list(payload, ("list", "sheets", "worksheets", "items", "data")):
@@ -360,16 +376,9 @@ def _extract_sheets(payload: Any) -> list[dict[str, Any]]:
         raw_id = item.get("id") or item.get("sheet_id") or item.get("sheetId")
         title = str(raw_title) if raw_title is not None else ""
         sheet_id = str(raw_id) if raw_id is not None else ""
-        count = item.get("row_count", item.get("rowCount"))
-        try:
-            count = int(count) if count is not None and count != "" else None
-        except (TypeError, ValueError):
-            count = None
-        column_count = item.get("column_count", item.get("columnCount", item.get("colCount")))
-        try:
-            column_count = int(column_count) if column_count is not None and column_count != "" else None
-        except (TypeError, ValueError):
-            column_count = None
+        # concise 模式下 rowCount/columnCount 可能是 0，真实网格大小在 rowTotal/columnTotal。
+        count = _first_positive_int(item, ("row_count", "rowCount", "rowTotal"))
+        column_count = _first_positive_int(item, ("column_count", "columnCount", "colCount", "columnTotal"))
         if title and sheet_id:
             result.append({"title": title, "id": sheet_id, "row_count": count, "column_count": column_count})
     return result
