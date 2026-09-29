@@ -13,6 +13,7 @@ from agent_types import (
     LocatedResult,
     SchedulePlan,
     clean_text,
+    col_letter,
     decision_arguments,
     first_message,
     function_tool,
@@ -230,7 +231,7 @@ class DocLocatorAgent:
                 {
                     "file_id": doc["id"],
                     "sheet_id": sheet["id"],
-                    "cell_range": f"A1:{_col_letter(column_count - 1)}{row_limit}",
+                    "cell_range": f"A1:{col_letter(column_count - 1)}{row_limit}",
                 },
                 LOCATOR_TOOL_NAMES,
                 LOCATOR_SCOPE_REJECTION,
@@ -280,7 +281,7 @@ class DocLocatorAgent:
         read_range = clean_text(payload.get("read_range") or payload.get("range"))
         if not read_range:
             fallback_cols = max(1, min(len(columns) or 30, 30))
-            read_range = f"A1:{_col_letter(fallback_cols - 1)}{min(row_limit, len(rows) + 1)}"
+            read_range = f"A1:{col_letter(fallback_cols - 1)}{min(row_limit, len(rows) + 1)}"
         note = clean_text(payload.get("note"))
         if truncated and not note:
             if total_known is not None:
@@ -345,18 +346,6 @@ def _extract_docs(payload: Any) -> list[dict[str, str]]:
         if title and file_id:
             result.append({"title": title, "id": file_id})
     return result
-
-
-def _col_letter(index: int) -> str:
-    """0 -> A, 25 -> Z, 26 -> AA …（列号转 A1 表示法字母）。"""
-    letter = ""
-    n = max(0, int(index))
-    while True:
-        letter = chr(n % 26 + 65) + letter
-        n = n // 26 - 1
-        if n < 0:
-            break
-    return letter
 
 
 def _first_positive_int(item: dict, keys: Iterable[str]) -> int | None:

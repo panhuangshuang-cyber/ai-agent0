@@ -61,7 +61,7 @@ def chat_timeout_message() -> str:
 ANALYSIS_READ_LIMIT_ROWS = 10000
 
 
-SCHEDULER_INTENTS = frozenset({"chat", "clarify", "lookup", "analyze"})
+SCHEDULER_INTENTS = frozenset({"chat", "clarify", "lookup", "analyze", "write"})
 LOCATOR_TOOL_NAMES = frozenset({
     "list_docs",
     "list_sheets",
@@ -70,10 +70,33 @@ LOCATOR_TOOL_NAMES = frozenset({
 })
 ANALYST_TOOL_NAMES = frozenset({"analyze_sheet_pandas"})
 MEMORY_TOOL_NAMES = frozenset({"update_memory_rule", "memory_decision"})
+#: 写入执行阶段的白名单：write_sheet 落笔，read_sheet 用于写前取旧值和写后回读。
+WRITER_TOOL_NAMES = frozenset({"write_sheet", "read_sheet"})
 
 LOCATOR_SCOPE_REJECTION = "这个工具不在文档定位的范围内"
 ANALYST_SCOPE_REJECTION = "这个工具不在数据分析的范围内"
+WRITER_SCOPE_REJECTION = "这个工具不在写入执行的范围内"
 INVALID_JSON_REJECTION = "工具参数不是合法 JSON"
+
+#: 腾讯表格 batchUpdate 的单次请求硬限制（与 MCP 服务端保持一致）。
+WRITE_MAX_ROWS = 1000
+WRITE_MAX_COLS = 200
+WRITE_MAX_CELLS = 10000
+
+#: 待确认写入的有效期（秒）。
+PENDING_WRITE_TTL_SECONDS = 600.0
+
+#: 用户单独回这些词就算确认；更长的句子交给正常流水线判断。
+CONFIRM_AFFIRMATIVES = frozenset({
+    "确认", "确定", "确认写入", "确定写入", "是", "是的", "对", "对的",
+    "执行", "好", "好的", "可以", "行", "写吧", "嗯", "ok", "OK", "yes",
+})
+
+#: 预览消息里的确认码，形如 W-x7Kd2mQ9。
+WRITE_TOKEN_RE = re.compile(r"\bW-[A-Za-z0-9_\-]{6,}\b")
+
+#: 以这些字符开头的值会被表格当成公式，一律拒写。
+FORMULA_VALUE_PREFIXES = ("=", "+", "-", "@")
 
 
 @dataclass
@@ -84,6 +107,8 @@ class SchedulePlan:
     doc_hint: str = ""
     sheet_hint: str = ""
     calc_goal: str = ""
+    #: write 意图专用：用户原话里「改哪一行、哪一列、改成什么」。
+    write_goal: str = ""
 
 
 @dataclass
@@ -114,6 +139,45 @@ class AnalysisResult:
     attempts: int = 0
     partial: bool = False
     partial_note: str = ""
+
+
+@dataclass
+class WriteProposal:
+    """写入代理的产出：只有「改哪一列、改成什么」，没有单元格地址。
+
+    地址由 app 从沙箱返回的真实行号 + located.columns 的列序算出，
+    模型无权决定往哪里写。
+    """
+
+    status: str
+    column: str = ""
+    new_value: str = ""
+    reason: str = ""
+
+
+@dataclass
+class WriteSpec:
+    """一次已通过校验、等待用户确认的写入。服务端是唯一权威副本。"""
+
+    token: str
+    file_id: str
+    sheet_id: str
+    doc_title: str
+    sheet_title: str
+    column: str
+    start_cell: str
+    end_cell: str
+    values: list[list[str]]
+    old_values: list[list[str]] = field(default_factory=list)
+    row_numbers: list[int] = field(default_factory=list)
+    expires_at: float = 0.0
+
+    def cell_range(self) -> str:
+        """"A1:A1" 形式；单格也必须写成左上:右下，裸 A1 会被接口拒绝。"""
+        return f"{self.start_cell}:{self.end_cell}"
+
+    def expired(self, now: float) -> bool:
+        return bool(self.expires_at) and now >= self.expires_at
 
 
 PARTIAL_ANALYSIS_PREFIX = "只读取了前"
@@ -188,6 +252,33 @@ def clip_text(value: Any, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit]
+
+
+def col_letter(index: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA …（0 基列号转 A1 表示法字母）。"""
+    letter = ""
+    n = max(0, int(index))
+    while True:
+        letter = chr(n % 26 + 65) + letter
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return letter
+
+
+def parse_a1(cell: Any) -> tuple[int, int] | None:
+    """"B3" -> (row=2, col=1)，0 基；不合法返回 None。"""
+    match = re.fullmatch(r"\$?([A-Za-z]{1,3})\$?(\d{1,7})", str(cell or "").strip())
+    if not match:
+        return None
+    letters = match.group(1).upper()
+    column = 0
+    for char in letters:
+        column = column * 26 + (ord(char) - 64)
+    row = int(match.group(2))
+    if row < 1:
+        return None
+    return row - 1, column - 1
 
 
 def history_block(prior_turns: Sequence[Mapping[str, Any]] | None) -> str:
