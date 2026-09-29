@@ -27,15 +27,18 @@ SCHEDULE_DECISION_TOOL = function_tool(
         "doc_hint": {"type": "string"},
         "sheet_hint": {"type": "string"},
         "calc_goal": {"type": "string"},
+        "write_goal": {"type": "string"},
     },
     ["intent", "question"],
 )
 
-SYSTEM_PROMPT = """你是调度代理。你只判断本轮属于闲聊、追问、查表还是统计，并且必须调用 schedule_decision。
-intent 只能是 chat、clarify、lookup、analyze。
-只有 chat 或 clarify 才能填写 reply；查表问题不要在 reply 里回答。
+SYSTEM_PROMPT = """你是调度代理。你只判断本轮属于闲聊、追问、查表、统计还是改表，并且必须调用 schedule_decision。
+intent 只能是 chat、clarify、lookup、analyze、write。
+只有 chat 或 clarify 才能填写 reply；查表和改表的问题不要在 reply 里回答，更不要声称已经改好了。
 question 去掉寒暄但保留用户用词。doc_hint 必须保持用户指代文档的原话，不得替换成记忆中的正式名称。
 sheet_hint 保留用户对子表的原话，没有就填空字符串。analyze 要在 calc_goal 写清计算目标；lookup 的 calc_goal 必须为空。
+用户要求修改、填写、更新、改成某个值时判为 write，并在 write_goal 里写清定位条件（哪一行）、目标列和要写进去的新值；
+write 的 calc_goal 必须为空。只是问「能不能改」「怎么改」属于 chat，不是 write。
 记忆中的别名只供理解，禁止改写进 doc_hint。你看不到文档，也不能编造查表结论。"""
 
 
@@ -110,7 +113,16 @@ class SchedulerAgent:
             doc_hint=clean_text(raw.get("doc_hint")),
             sheet_hint=clean_text(raw.get("sheet_hint")),
             calc_goal=clean_text(raw.get("calc_goal")),
+            write_goal=clean_text(raw.get("write_goal")),
         )
+        if plan.intent == "write":
+            # 必须独占处理：下面 `if plan.calc_goal` 的改写会把 write 劫持成 analyze。
+            if not plan.write_goal:
+                return None
+            plan.reply = ""
+            plan.calc_goal = ""
+            return plan
+        plan.write_goal = ""
         if plan.calc_goal:
             plan.intent = "analyze"
         elif plan.intent == "analyze":
@@ -127,6 +139,8 @@ class SchedulerAgent:
             return False
         if plan.intent in {"chat", "clarify"}:
             return bool(plan.reply)
+        if plan.intent == "write":
+            return bool(plan.write_goal)
         return True
 
 

@@ -191,7 +191,7 @@ def build_ui(chat_fn):
                 chatbot = gr.Chatbot(
                     elem_classes=["main-window"],
                     show_label=False,
-                    placeholder="<div style='text-align: center; color: gray; margin-top: 20vh; font-size: 16px; line-height: 1.8;'>💡 <b>专属长期记忆提示</b><br><br>您可以对我说「记住，以后我说 A 就代表文档 B」来训练我的长期记忆。<br><br><span style='color: #a0a0a0; font-size: 15px;'><i>例如：【 记住，以后我说“封边条”就是指“封边条250424” 】</i></span><br><br>系统将为您自动记录规则，越用越懂您！</div>"
+                    placeholder="<div style='text-align: center; color: gray; margin-top: 12vh; font-size: 16px; line-height: 1.8;'>💡 <b>专属长期记忆提示</b><br><br>您可以对我说「记住，以后我说 A 就代表文档 B」来训练我的长期记忆。<br><br><span style='color: #a0a0a0; font-size: 15px;'><i>例如：【 记住，以后我说“封边条”就是指“封边条250424” 】</i></span><br><br>系统将为您自动记录规则，越用越懂您！<br><br>✏️ <b>修改表格</b><br><br>也可以让我改单元格里的内容。<br><br><span style='color: #a0a0a0; font-size: 15px;'><i>例如：【 把 tx 表里单号 A1 那行的单价改成 88 】</i></span><br><br>我会先把要改的位置和新旧值列出来，您回复「确认」之后才会真的写入。</div>"
                 )
                 # 下半部分：输入框
                 with gr.Row():
