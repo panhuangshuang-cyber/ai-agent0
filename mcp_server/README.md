@@ -5,15 +5,21 @@
 
 - `server.py`：MCP 服务（工具名/参数向后兼容）。
 - `safe_pandas.py`：受限 pandas 沙箱，必须与仓库根目录的 `safe_pandas.py` **逐字节一致**。
+- `client.py`：腾讯文档 OpenAPI 客户端，必须与生产目录的 `client.py` **逐字节一致**。
+  文件里没有凭证：token 走构造函数参数、环境变量 `TENCENT_DOCS_ACCESS_TOKEN` +
+  `TENCENT_DOCS_OPEN_ID`，或 `~/.tencent-docs-mcp/token.json`。
 - `test_server_sandbox.py`：离线测试（不联网，FakeClient 注入）。
 
-`client.py`（腾讯文档 OpenAPI 客户端）以及 token 文件只存在于生产目录，**不提交到仓库**；
-测试在缺少 `client.py` 时会自动使用离线桩。
+token 文件（`~/.tencent-docs-mcp/token.json`）只存在于生产目录，**不提交到仓库**。
 
-部署：把 `server.py`、`safe_pandas.py` 复制到 `~/tencent-docs-mcp/`，然后重启 web 服务。
+部署：把 `server.py`、`safe_pandas.py`、`client.py` 复制到 `~/tencent-docs-mcp/`，然后重启 web 服务。
 
 测试：
 
 ```bash
-cd mcp_server && PYTHONDONTWRITEBYTECODE=1 python -m unittest test_server_sandbox -v
+cd mcp_server && PYTHONDONTWRITEBYTECODE=1 python -m unittest test_server_sandbox test_vendored_sync -v
 ```
+
+`test_vendored_sync` 校验上面那几条「逐字节一致」：仓库内两份 `safe_pandas.py` 互相比对，
+`server.py` / `client.py` / `safe_pandas.py` 再与生产目录（`MCP_SERVER_DIR`，默认
+`~/tencent-docs-mcp`）比对。生产目录不存在时跳过，不算失败。

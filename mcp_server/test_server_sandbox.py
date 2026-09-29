@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-try:  # 生产目录里有 client.py；仓库里（mcp_server/）不提交 client.py，用离线桩代替。
+try:  # client.py 已 vendored 在本目录；依赖缺失（如 httpx）时退回离线桩。
     import client  # noqa: F401,E402
 except ImportError:
     import types
