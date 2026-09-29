@@ -17,5 +17,9 @@ token 文件（`~/.tencent-docs-mcp/token.json`）只存在于生产目录，**�
 测试：
 
 ```bash
-cd mcp_server && PYTHONDONTWRITEBYTECODE=1 python -m unittest test_server_sandbox -v
+cd mcp_server && PYTHONDONTWRITEBYTECODE=1 python -m unittest test_server_sandbox test_vendored_sync -v
 ```
+
+`test_vendored_sync` 校验上面那几条「逐字节一致」：仓库内两份 `safe_pandas.py` 互相比对，
+`server.py` / `client.py` / `safe_pandas.py` 再与生产目录（`MCP_SERVER_DIR`，默认
+`~/tencent-docs-mcp`）比对。生产目录不存在时跳过，不算失败。
